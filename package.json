@@ -92,7 +92,7 @@
     "@playwright/test": "1.61.1",
     "@types/node": "^26.1.0",
     "esbuild": "^0.28.1",
-    "mediabunny": "1.50.8",
+    "mediabunny": "1.52.3",
     "typescript": "^7.0.2"
   }
 }
