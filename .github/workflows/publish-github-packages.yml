@@ -29,9 +29,7 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: '@jhodges10'
       - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
+        uses: ./.github/actions/setup-zig
       - name: Set up Emscripten
         uses: mymindstorm/setup-emsdk@4528d102f7230f0e7b276855c01ea1159be0e984 # v16
         with:

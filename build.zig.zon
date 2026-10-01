@@ -2,7 +2,7 @@
     .name = .turbovc3,
     .version = "0.1.0",
     .fingerprint = 0x94499dad6a675463,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.2375+d8aab4878",
     .dependencies = .{},
     .paths = .{
         "build.zig",

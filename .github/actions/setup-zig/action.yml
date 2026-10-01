@@ -1,0 +1,22 @@
+name: Pinned Zig
+description: Install the checked development snapshot and restore compiler cache
+inputs:
+  cache-key:
+    description: Additional build-cache partition
+    default: native
+  cache-size-limit:
+    description: Retained for compatibility with existing workflow invocations
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/install.sh"
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/zig
+          ~/AppData/Local/zig
+        key: zig-${{ runner.os }}-${{ runner.arch }}-0.17.0-dev.2375+d8aab4878-${{ inputs.cache-key }}-${{ github.sha }}
+        restore-keys: |
+          zig-${{ runner.os }}-${{ runner.arch }}-0.17.0-dev.2375+d8aab4878-${{ inputs.cache-key }}-

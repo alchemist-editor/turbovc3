@@ -17,13 +17,13 @@ var packet_bytes: [MAX_PACKET_BYTES]u8 align(16) = undefined;
 var row_starts: [MAX_ROWS]u32 align(16) = undefined;
 var row_ends: [MAX_ROWS]u32 align(16) = undefined;
 var frame_bytes: [MAX_FRAME_BYTES]u8 align(16) = undefined;
-var dc_lookup: [LOOKUP_SIZE]u16 align(16) = [_]u16{0} ** LOOKUP_SIZE;
-var ac_lookup: [LOOKUP_SIZE]u16 align(16) = [_]u16{0} ** LOOKUP_SIZE;
-var run_lookup: [LOOKUP_SIZE]u16 align(16) = [_]u16{0} ** LOOKUP_SIZE;
-var ac_info: [MAX_AC_INFO]u16 align(16) = [_]u16{0} ** MAX_AC_INFO;
-var run_values: [MAX_RUN_VALUES]u8 align(16) = [_]u8{0} ** MAX_RUN_VALUES;
-var luma_weight: [64]u16 align(16) = [_]u16{0} ** 64;
-var chroma_weight: [64]u16 align(16) = [_]u16{0} ** 64;
+var dc_lookup: [LOOKUP_SIZE]u16 align(16) = @as([LOOKUP_SIZE]u16, @splat(0));
+var ac_lookup: [LOOKUP_SIZE]u16 align(16) = @as([LOOKUP_SIZE]u16, @splat(0));
+var run_lookup: [LOOKUP_SIZE]u16 align(16) = @as([LOOKUP_SIZE]u16, @splat(0));
+var ac_info: [MAX_AC_INFO]u16 align(16) = @as([MAX_AC_INFO]u16, @splat(0));
+var run_values: [MAX_RUN_VALUES]u8 align(16) = @as([MAX_RUN_VALUES]u8, @splat(0));
+var luma_weight: [64]u16 align(16) = @as([64]u16, @splat(0));
+var chroma_weight: [64]u16 align(16) = @as([64]u16, @splat(0));
 var coefficients: [MAX_BLOCKS * 64]i32 align(16) = undefined;
 var samples: [MAX_BLOCKS * 64]u16 align(16) = undefined;
 var diagnostic_stage: u32 = 0;
@@ -221,11 +221,11 @@ pub export fn dnx_decode_row(
         (bit_depth != 8 and bit_depth != 10 and bit_depth != 12) or ac_info_length > MAX_AC_INFO or
         run_values_length > MAX_RUN_VALUES or level_shift > 31 or is_444 > 1)
     {
-        return @intFromEnum(DecodeError.invalid_arguments);
+        return @backingInt(DecodeError.invalid_arguments);
     }
 
     diagnostic_row = 0;
-    return @intFromEnum(decodeRowBytes(
+    return @backingInt(decodeRowBytes(
         row_bytes[0..row_length],
         macroblock_width,
         bit_depth,
@@ -258,19 +258,19 @@ pub export fn dnx_decode_frame(
         (bit_depth != 8 and bit_depth != 10 and bit_depth != 12) or ac_info_length > MAX_AC_INFO or
         run_values_length > MAX_RUN_VALUES or level_shift > 31 or is_444 > 1 or mbaff > 1)
     {
-        return @intFromEnum(DecodeError.invalid_arguments);
+        return @backingInt(DecodeError.invalid_arguments);
     }
     const bytes_per_sample: u64 = if (bit_depth == 8) 1 else 2;
     const plane_count: u64 = if (is_444 != 0) 3 else 2;
     const frame_byte_length = @as(u64, macroblock_width) * 16 * macroblock_height * 16 * plane_count * bytes_per_sample;
-    if (frame_byte_length > MAX_FRAME_BYTES) return @intFromEnum(DecodeError.invalid_arguments);
+    if (frame_byte_length > MAX_FRAME_BYTES) return @backingInt(DecodeError.invalid_arguments);
 
     for (0..macroblock_height) |row| {
         diagnostic_row = @intCast(row);
         const start = row_starts[row];
         const end = row_ends[row];
         if (start > end or end > packet_length) {
-            return @intFromEnum(DecodeError.invalid_arguments);
+            return @backingInt(DecodeError.invalid_arguments);
         }
         const result = decodeRowIntoFrame(
             packet_bytes[start..end],
@@ -287,22 +287,22 @@ pub export fn dnx_decode_frame(
             is_444 != 0,
             mbaff != 0,
         );
-        if (result != .ok) return @intFromEnum(result);
+        if (result != .ok) return @backingInt(result);
     }
 
     diagnostic_stage = 6;
-    return @intFromEnum(DecodeError.ok);
+    return @backingInt(DecodeError.ok);
 }
 
 test "native capacity exports and oversized arguments are safe" {
     try std.testing.expectEqual(@as(u32, MAX_MACROBLOCKS), dnx_macroblock_capacity());
     try std.testing.expectEqual(@as(u32, MAX_ROWS), dnx_rows_capacity());
     try std.testing.expectEqual(
-        @intFromEnum(DecodeError.invalid_arguments),
+        @backingInt(DecodeError.invalid_arguments),
         dnx_decode_row(0, MAX_MACROBLOCKS + 1, 8, 0, 0, 0, 0, 0, 0, 0),
     );
     try std.testing.expectEqual(
-        @intFromEnum(DecodeError.invalid_arguments),
+        @backingInt(DecodeError.invalid_arguments),
         dnx_decode_frame(0, std.math.maxInt(u32), std.math.maxInt(u32), 12, 0, 0, 0, 0, 0, 0, 1, 0),
     );
 }
@@ -497,10 +497,10 @@ fn decodeRowBytes(
 
 pub export fn dnx_idct_blocks(block_count: u32, bit_depth: u32) u32 {
     if (block_count == 0 or block_count > MAX_BLOCKS or (bit_depth != 8 and bit_depth != 10 and bit_depth != 12)) {
-        return @intFromEnum(DecodeError.invalid_arguments);
+        return @backingInt(DecodeError.invalid_arguments);
     }
     inverseDctBlocks(coefficients[0..].ptr, samples[0..].ptr, block_count, bit_depth);
-    return @intFromEnum(DecodeError.ok);
+    return @backingInt(DecodeError.ok);
 }
 
 inline fn decodeBlock(
@@ -667,7 +667,6 @@ fn storeBlock(
         }
     }
 }
-
 
 test "native decode oracle frame via export buffers" {
     const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/beach-frame0.bin", std.testing.allocator, .limited(2 * 1024 * 1024)) catch return;

@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(example);
     const run_example = b.addRunArtifact(example);
-    if (b.args) |args| run_example.addArgs(args);
+    run_example.addPassthruArgs();
     const example_step = b.step("example", "Decode frame 0 of an MXF (pass path after --)");
     example_step.dependOn(&run_example.step);
 }

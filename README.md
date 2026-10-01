@@ -267,7 +267,7 @@ diagnostics. Run it with `npm run example:browser`.
 
 ## Native Zig package
 
-Alongside the TypeScript/WASM surface, turbovc3 ships a first-class native Zig package (Zig `0.16.0`) rooted at
+Alongside the TypeScript/WASM surface, turbovc3 ships a first-class native Zig package (Zig `0.17.0-dev.2375+d8aab4878`) rooted at
 [src/native/root.zig](src/native/root.zig). It shares the same Zig row-decoder sources as the WASM build, so the two
 surfaces cannot drift. The module exposes:
 
@@ -308,7 +308,7 @@ npm test
 npm run test:package
 ```
 
-Native development additionally requires Zig `0.16.0` and Emscripten `6.0.2`:
+Native development additionally requires Zig `0.17.0-dev.2375+d8aab4878` and Emscripten `6.0.2`:
 
 ```sh
 npm run build:wasm
