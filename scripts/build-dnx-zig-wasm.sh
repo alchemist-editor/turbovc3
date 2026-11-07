@@ -5,12 +5,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/src/native/dnx_row_decoder.zig"
 OUT_DIR="$ROOT/wasm/generated"
-EXPECTED_ZIG_VERSION="0.16.0"
+EXPECTED_ZIG_VERSION="0.17.0"
 
 if [[ -n "${ZIG:-}" ]]; then
   ZIG_BIN="$ZIG"
-elif [[ -x "/opt/homebrew/opt/zig@0.16/bin/zig" ]]; then
-  ZIG_BIN="/opt/homebrew/opt/zig@0.16/bin/zig"
+elif [[ -x "/opt/homebrew/opt/zig@0.17/bin/zig" ]]; then
+  ZIG_BIN="/opt/homebrew/opt/zig@0.17/bin/zig"
 elif command -v zig >/dev/null 2>&1; then
   ZIG_BIN="$(command -v zig)"
 else
