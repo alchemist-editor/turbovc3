@@ -39,7 +39,7 @@ scripts/generate-ci-fixtures.sh
 npm run fixtures:verify
 ```
 
-Native backend changes require Zig 0.16.0 and Emscripten 6.0.2:
+Native backend changes require Zig 0.17.0 and Emscripten 6.0.2:
 
 ```sh
 npm run build:wasm
