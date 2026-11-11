@@ -59,6 +59,108 @@ test("missing native assets fall back to TypeScript", async ({ page }) => {
   expect(result.filled).toBe(true);
 });
 
+test("wasm and worker URL options reach every backend", async ({ page }) => {
+  const root = new URL("../..", import.meta.url);
+  // The default location is gone; only the overridden URLs serve the modules.
+  await page.route("**/wasm/generated/*.wasm", (route) => route.fulfill({ status: 404 }));
+  await page.route("**/moved/*.wasm", (route) => {
+    const name = new URL(route.request().url()).pathname.endsWith("row.wasm")
+      ? "dnx_row_decoder.wasm"
+      : "dnx_idct_kernel.wasm";
+    return route.fulfill({
+      path: new URL(`wasm/generated/${name}`, root).pathname,
+      contentType: "application/wasm",
+      headers: { "Cross-Origin-Resource-Policy": "same-origin" }
+    });
+  });
+  const workerRequests = [];
+  page.on("request", (request) => {
+    if (request.url().includes("?moved=1")) workerRequests.push(new URL(request.url()).pathname);
+  });
+  await page.goto("/");
+  const urls = {
+    wasmUrls: { rowDecoder: "/moved/row.wasm", idctKernel: "/moved/idct.wasm" },
+    workerUrls: {
+      sharedRow: "/dist/workers/dnxSharedRowDecode.worker.js?moved=1",
+      packet: "/dist/workers/dnxPacketDecode.worker.js?moved=1"
+    }
+  };
+  const sync = await decodeFixture(page, { concurrency: 0, useSharedMemory: false, ...urls });
+  expect(sync.mode).toBe("zig-wasm-frame");
+  const packet = await decodeFixture(page, { concurrency: 2, useSharedMemory: false, ...urls });
+  expect(packet.mode).toBe("worker-pool/zig-wasm-frame");
+  const shared = await decodeFixture(page, { concurrency: 2, useSharedMemory: true, ...urls });
+  expect(shared.mode).toBe("shared-row-workers/zig-wasm-row");
+  expect(new Set(workerRequests)).toEqual(
+    new Set(["/dist/workers/dnxPacketDecode.worker.js", "/dist/workers/dnxSharedRowDecode.worker.js"])
+  );
+});
+
+test("worker start failures are reported and the decoder falls back", async ({ page }) => {
+  await page.goto("/");
+  const result = await page.evaluate(async () => {
+    const { Decoder } = await import("/dist/dnxDecoder.js");
+    const errors = [];
+    const decoder = await Decoder.create({
+      dnxFourCc: "AVdh",
+      useSharedMemory: true,
+      concurrency: 2,
+      workerUrls: { sharedRow: "/missing/row.worker.js", packet: "/missing/packet.worker.js" },
+      onWorkerStartError: ({ backend, error }) => errors.push({ backend, message: error.message })
+    });
+    if (decoder instanceof Error) throw decoder;
+    const mode = decoder.idctMode;
+    await decoder.close();
+    return { mode, backends: errors.map((e) => e.backend) };
+  });
+  expect(result.backends).toEqual(["shared-row", "packet"]);
+  expect(result.mode).toBe("zig-wasm-frame");
+});
+
+test("Mediabunny decoders share one worker pool across getSample calls", async ({ page }) => {
+  // dist imports the bare "mediabunny" specifier: map it for this page.
+  await page.route("**/", async (route) => {
+    const response = await route.fetch();
+    const html = (await response.text()).replace(
+      "<head>",
+      '<head><script type="importmap">{"imports":{"mediabunny":"/node_modules/mediabunny/dist/bundles/mediabunny.mjs"}}</script>'
+    );
+    await route.fulfill({ response, body: html });
+  });
+  await page.goto("/");
+  const workersStarted = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/dist/workers/")) workersStarted.push(request.url());
+  });
+  const result = await page.evaluate(async () => {
+    const [{ registerDnxDecoder }, { sharedDecoderPoolStats }] = await Promise.all([
+      import("/dist/dnxMediabunny.js"),
+      import("/dist/dnxSharedDecoderPool.js")
+    ]);
+    const mediabunny = await import("mediabunny");
+    registerDnxDecoder({ useSharedMemory: false, idleCloseMs: 2000 });
+    const response = await fetch("/tests/fixtures/oracle_dnxhr_lb_1080p30_8bit_cid1274.mov");
+    const input = new mediabunny.Input({
+      formats: [new mediabunny.QuickTimeInputFormat()],
+      source: new mediabunny.BufferSource(new Uint8Array(await response.arrayBuffer()))
+    });
+    const track = await input.getPrimaryVideoTrack();
+    const sink = new mediabunny.VideoSampleSink(track);
+    const decoders = [];
+    for (let i = 0; i < 4; i += 1) {
+      const sample = await sink.getSample(0);
+      sample.close();
+      decoders.push(sharedDecoderPoolStats().decoders);
+    }
+    input.dispose();
+    return { decoders, concurrency: Math.min(4, Math.max(1, navigator.hardwareConcurrency ?? 4)) };
+  });
+  // Four getSample calls, four Mediabunny decoders, one shared turbovc3 decoder.
+  expect(Math.max(...result.decoders)).toBe(1);
+  // One pool's workers, not one pool per call (Cache-Control: no-store, so each start is a request).
+  expect(workersStarted.length).toBe(result.concurrency);
+});
+
 test("Canvas2D fallback renders deterministic pixels", async ({ page }) => {
   await page.goto("/");
   const pixels = await page.evaluate(async () => {

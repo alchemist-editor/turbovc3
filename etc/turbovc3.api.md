@@ -4,6 +4,12 @@
 
 ```ts
 
+// @public
+export function acquireSharedDecoder(options: SharedDecoderOptions): Promise<SharedDecoderLease | DnxNotSupportedError>;
+
+// @public
+export function closeSharedDecoders(): Promise<void>;
+
 // @public (undocumented)
 export interface DecodeColorSpace {
     // (undocumented)
@@ -121,11 +127,17 @@ export interface DecoderOptions {
     concurrency?: number;
     // (undocumented)
     dnxFourCc: DnxFourCc;
+    onWorkerStartError?: (error: DnxWorkerStartError) => void;
     // (undocumented)
     useSharedMemory: boolean;
+    wasmUrls?: DnxWasmUrls;
     // (undocumented)
     workerFactory?: DnxWorkerFactory;
+    workerUrls?: DnxWorkerUrls;
 }
+
+// @public (undocumented)
+export const DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS = 1000;
 
 // @public
 export function deinterlaceDnxFrameLayout(source: DnxFrameLayout, parity: DnxFieldParity): DnxFrameLayout;
@@ -622,6 +634,14 @@ export interface DnxVideoFrameOptions {
     timestamp: number;
 }
 
+// @public
+export interface DnxWasmUrls {
+    // (undocumented)
+    idctKernel?: string | URL;
+    // (undocumented)
+    rowDecoder?: string | URL;
+}
+
 // @public (undocumented)
 export class DnxWebGpuRenderer {
     // (undocumented)
@@ -665,6 +685,22 @@ export type DnxWorkerFactory = (kind: DnxWorkerKind, moduleUrl: URL) => DnxWorke
 
 // @public (undocumented)
 export type DnxWorkerKind = "packet" | "shared-row";
+
+// @public
+export interface DnxWorkerStartError {
+    // (undocumented)
+    backend: DnxWorkerKind;
+    // (undocumented)
+    error: Error;
+}
+
+// @public
+export interface DnxWorkerUrls {
+    // (undocumented)
+    packet?: string | URL;
+    // (undocumented)
+    sharedRow?: string | URL;
+}
 
 // @public (undocumented)
 export type FilledFrame = {
@@ -1246,7 +1282,37 @@ export function parseDnxFrameHeader(packet: Uint8Array, options?: {
 export function parseDnxMxfEditRate(bytes: Uint8Array): DnxMxfEditRate | null;
 
 // @public
-export function registerDnxDecoder(): void;
+export function registerDnxDecoder(options?: RegisterDnxDecoderOptions): void;
+
+// @public
+export interface RegisterDnxDecoderOptions {
+    idleCloseMs?: number;
+    onWorkerStartError?: (error: DnxWorkerStartError) => void;
+    useSharedMemory?: boolean;
+    wasmUrls?: DnxWasmUrls;
+    workerUrls?: DnxWorkerUrls;
+}
+
+// @public (undocumented)
+export interface SharedDecoderLease {
+    // (undocumented)
+    readonly decoder: Decoder;
+    release(): void;
+}
+
+// @public
+export interface SharedDecoderOptions extends DecoderOptions {
+    idleCloseMs?: number;
+}
+
+// @public
+export interface SharedDecoderPoolStats {
+    decoders: number;
+    leases: number;
+}
+
+// @public (undocumented)
+export function sharedDecoderPoolStats(): SharedDecoderPoolStats;
 
 // @public (undocumented)
 export function summarizeDnxFrameHeader(header: DnxFrameHeader): string;

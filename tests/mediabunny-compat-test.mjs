@@ -50,6 +50,30 @@ try {
   input.dispose();
 }
 
+// Options: a later call replaces them. Every getSample() builds a Mediabunny
+// decoder; they share one turbovc3 decoder, which closes when they are done.
+module.registerDnxDecoder({ useSharedMemory: false, idleCloseMs: 0 });
+const seekInput = new module.Input({
+  formats: [new module.QuickTimeInputFormat()],
+  source: new module.BufferSource(bytes)
+});
+try {
+  const track = await seekInput.getPrimaryVideoTrack();
+  const sink = new module.VideoSampleSink(track);
+  for (let i = 0; i < 3; i += 1) {
+    const sample = await sink.getSample(0);
+    assert.ok(sample);
+    sample.close();
+  }
+  // Mediabunny closes its decoder asynchronously after the sample is out.
+  for (let i = 0; i < 50 && module.sharedDecoderPoolStats().decoders > 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(module.sharedDecoderPoolStats(), { decoders: 0, leases: 0 });
+} finally {
+  seekInput.dispose();
+}
+
 console.log("Mediabunny compatibility preflight and DNx decode passed.");
 
 async function loadModule() {
@@ -58,6 +82,7 @@ async function loadModule() {
     stdin: {
       contents: `
         export { registerDnxDecoder } from ${entry};
+        export { sharedDecoderPoolStats } from ${JSON.stringify(path.join(repoRoot, "src/dnxSharedDecoderPool.ts"))};
         export { BufferSource, Input, InputVideoTrack, QuickTimeInputFormat, VideoSampleSink } from "mediabunny";
       `,
       resolveDir: repoRoot,
