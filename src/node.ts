@@ -7,17 +7,34 @@ import {
 import type {
   DnxWorker,
   DnxWorkerFactory,
-  DnxWorkerKind
+  DnxWorkerKind,
+  DnxWorkerUrls
 } from "./dnxWorker.js";
 
 export * from "./index.js";
 
+/**
+ * {@link DecoderOptions} without `workerFactory`: workers are
+ * `node:worker_threads` workers running the package's Node wrappers. A
+ * `workerUrls` entry replaces that kind's wrapper; it must be a
+ * `worker_threads` module, like `dist/workers/dnxNodePacketDecode.worker.js`.
+ */
 export type NodeDecoderOptions = Omit<DecoderOptions, "workerFactory">;
 
 export function createNodeDecoder(
   options: NodeDecoderOptions
 ): Promise<DnxNotSupportedError | Decoder> {
-  return Decoder.create({ ...options, workerFactory: createNodeWorker });
+  return Decoder.create({ ...options, workerFactory: nodeWorkerFactory(options.workerUrls) });
+}
+
+/** The Node wrappers, except for a kind `workerUrls` overrides: that one runs the URL the decoder resolved. */
+function nodeWorkerFactory(workerUrls: DnxWorkerUrls | undefined): DnxWorkerFactory {
+  return (kind, moduleUrl) => {
+    const override = kind === "packet" ? workerUrls?.packet : workerUrls?.sharedRow;
+    return override === undefined
+      ? createNodeWorker(kind, moduleUrl)
+      : new NodeWorkerAdapter(kind, new NodeWorker(moduleUrl));
+  };
 }
 
 export const createNodeWorker: DnxWorkerFactory = (kind) => {
