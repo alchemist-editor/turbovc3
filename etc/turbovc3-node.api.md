@@ -1283,7 +1283,7 @@ export interface MxfTrack {
 // @public (undocumented)
 export type MxfTrackKind = "video" | "audio" | "data" | "system" | "unknown";
 
-// @public (undocumented)
+// @public
 export type NodeDecoderOptions = Omit<DecoderOptions, "workerFactory">;
 
 // @public (undocumented)
