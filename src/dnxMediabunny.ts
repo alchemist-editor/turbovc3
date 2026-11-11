@@ -176,6 +176,8 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
   private lease: SharedDecoderLease | null = null;
   private readonly framePool: Frame[] = [];
   private emissionTail: Promise<void> = Promise.resolve();
+  /** Set once this instance can no longer decode; already reported through onError. */
+  private failure: Error | null = null;
 
   static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
     const dnxFourCc = normalizeDnxFourCc(config.codec);
@@ -214,18 +216,22 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
   // flush() and close() rely on Mediabunny serializing custom decoder calls
   // (one CallSerializer for decode, flush and close), so a decode has always
   // chained onto emissionTail before a later flush or close runs.
+  //
+  // decode() never rejects. That serializer is a promise chain: once a call
+  // rejects, every later call rejects with the same error without running.
+  // Mediabunny 1.50.8 then never closes the decoder (its flush rejects first);
+  // later releases still call close() and leave that rejection unhandled.
+  // Failures go to onError instead, and flush() and close() stay safe.
   async decode(packet: EncodedPacket): Promise<void> {
+    if (this.failure) {
+      return;
+    }
     const decoder = this.requireDecoder();
     while (decoder.desiredSize <= 0) {
       if (!decoder.isUsable) {
-        // Its workers died: no capacity will ever free up, so waiting would
-        // hang. Mediabunny's call serializer skips flush() and close() after a
-        // rejected decode(), so hand the decoder back here, as failed (closed).
-        this.lease?.markFailed();
-        this.lease?.release();
-        this.lease = null;
-        this.decoder = null;
-        throw new DnxDecoderError("DNx decoder can no longer decode: its workers failed.");
+        // Its workers died: no capacity will ever free up, so waiting would hang.
+        this.fail(new DnxDecoderError("DNx decoder can no longer decode: its workers failed."));
+        return;
       }
       await decoder.dequeued;
     }
@@ -250,14 +256,15 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
   }
 
   async flush(): Promise<void> {
-    this.requireDecoder();
+    if (!this.failure) {
+      this.requireDecoder();
+    }
     // Every decode this instance queued settles through emissionTail.
     await this.emissionTail;
   }
 
   async close(): Promise<void> {
-    const decoder = this.decoder;
-    if (!decoder) {
+    if (!this.decoder && !this.failure) {
       return;
     }
 
@@ -290,6 +297,19 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     } finally {
       this.framePool.push(frame);
     }
+  }
+
+  /**
+   * Report `error`, and give the decoder back now as failed (so it is closed,
+   * not reused): Mediabunny may never call close() on a stalled decoder.
+   */
+  private fail(error: Error): void {
+    this.failure = error;
+    this.lease?.markFailed();
+    this.lease?.release();
+    this.lease = null;
+    this.decoder = null;
+    this.onError(error);
   }
 
   private requireDecoder(): Decoder {
