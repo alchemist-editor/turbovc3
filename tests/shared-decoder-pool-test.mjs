@@ -37,6 +37,10 @@ function fakeWorkers() {
       },
       terminate() {
         live.delete(worker);
+      },
+      /** The worker crashes (an uncaught error in the worker). */
+      crash() {
+        for (const fn of [...listeners.error]) fn({ message: "worker crashed" });
       }
     };
     live.add(worker);
@@ -230,6 +234,7 @@ await run("a lease marked failed closes its decoder on release; the next lease b
   setSharedDecoderFactoryForTests(async () => {
     const decoder = {
       isClosed: false,
+      isUsable: true,
       closes: 0,
       async close() {
         decoder.closes += 1;
@@ -273,5 +278,30 @@ await run("a decoder released after closeSharedDecoders closes instead of parkin
   assert.equal(workers.live.size, 0);
   assert.equal(sharedDecoderPoolStats().idle, 0);
 });
+
+for (const useSharedMemory of [false, true]) {
+  const backend = useSharedMemory ? "shared-row" : "packet";
+  await run(`an idle decoder whose ${backend} workers died is discarded, not handed to the next lease`, async () => {
+    const workers = fakeWorkers();
+    const options = { ...base, useSharedMemory, workerFactory: workers.factory, idleCloseMs: 60_000 };
+    const first = await acquireSharedDecoder(options);
+    assert.ok(!(first instanceof Error));
+    assert.equal(first.decoder.isUsable, true);
+    first.release();
+    assert.equal(sharedDecoderPoolStats().idle, 1);
+    // Every worker crashes while the decoder waits idle.
+    for (const worker of [...workers.live]) worker.crash();
+    assert.equal(first.decoder.isUsable, false);
+    const before = sharedDecoderPoolStats().discarded;
+    const next = await acquireSharedDecoder(options);
+    assert.ok(!(next instanceof Error));
+    assert.notEqual(next.decoder, first.decoder);
+    assert.equal(next.decoder.isUsable, true);
+    assert.equal(first.decoder.isClosed, true);
+    assert.equal(sharedDecoderPoolStats().discarded, before + 1);
+    assert.equal(workers.created(), 4);
+    next.release();
+  });
+}
 
 console.log("Shared decoder pool tests passed.");

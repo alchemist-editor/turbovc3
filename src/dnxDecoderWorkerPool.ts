@@ -89,6 +89,11 @@ export class DnxDecoderWorkerPool {
     return this.dequeuedPromise;
   }
 
+  /** False once closed or once every packet worker has failed. */
+  get isUsable(): boolean {
+    return !this.closed && this.slots.some((slot) => !slot.failed);
+  }
+
   get mode(): string {
     return this.currentMode;
   }

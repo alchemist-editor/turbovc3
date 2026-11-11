@@ -87,6 +87,11 @@ export class DnxSharedRowDecoder {
     return this.dequeuedPromise;
   }
 
+  /** False once closed or once every row worker has failed. */
+  get isUsable(): boolean {
+    return !this.closed && this.slots.some((slot) => !slot.failed);
+  }
+
   decode(
     packet: Uint8Array,
     header: DnxFrameHeader,

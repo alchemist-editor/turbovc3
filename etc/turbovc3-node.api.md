@@ -121,6 +121,7 @@ export class Decoder implements AsyncDisposable {
     get idctMode(): string;
     // (undocumented)
     get isClosed(): boolean;
+    get isUsable(): boolean;
     // (undocumented)
     readonly useSharedMemory: boolean;
 }

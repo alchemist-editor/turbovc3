@@ -13,7 +13,8 @@ import { Decoder, type DecoderOptions, type DnxNotSupportedError } from "./dnxDe
  * waits idle for the next lease of the same configuration and closes after
  * `idleCloseMs`; at most `maxIdleDecoders` wait per configuration. A lease
  * marked failed (a decode rejected, a worker died) closes its decoder on
- * release instead of parking it, so no later caller inherits a broken one.
+ * release instead of parking it, and an idle decoder whose workers died is
+ * closed rather than handed out, so no later caller inherits a broken one.
  */
 
 export interface SharedDecoderOptions extends DecoderOptions {
@@ -43,7 +44,11 @@ export interface SharedDecoderPoolStats {
   leases: number;
   /** Released decoders waiting for the next lease. */
   idle: number;
-  /** Decoders closed on release because their lease was marked failed, since load. */
+  /**
+   * Decoders closed instead of reused since load: on release because their
+   * lease was marked failed, or when taken from idle because they could no
+   * longer decode (`Decoder.isUsable` false).
+   */
   discarded: number;
 }
 
@@ -83,9 +88,16 @@ export async function acquireSharedDecoder(
     if (idle.timer !== null) {
       clearTimeout(idle.timer);
     }
-    if (!idle.decoder.isClosed) {
-      decoder = idle.decoder;
+    if (idle.decoder.isClosed) {
+      continue;
     }
+    if (!idle.decoder.isUsable) {
+      // Its workers died while it waited: never hand it to the next lease.
+      discarded += 1;
+      void idle.decoder.close();
+      continue;
+    }
+    decoder = idle.decoder;
   }
   if (!decoder) {
     const { idleCloseMs: _idle, maxIdleDecoders: _max, ...decoderOptions } = options;

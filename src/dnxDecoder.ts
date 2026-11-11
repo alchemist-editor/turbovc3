@@ -400,6 +400,19 @@ export class Decoder implements AsyncDisposable {
     return this.closed;
   }
 
+  /**
+   * False when this decoder can no longer decode: it is closed, or its worker
+   * backend lost every worker (they crashed or failed). Such a decoder never
+   * frees capacity, so `desiredSize` stays at or below zero; close it and
+   * create another.
+   */
+  get isUsable(): boolean {
+    if (this.closed) {
+      return false;
+    }
+    return this.sharedRowDecoder?.isUsable ?? this.workerPool?.isUsable ?? true;
+  }
+
   get idctMode(): string {
     return this.sharedRowDecoder?.mode ?? this.workerPool?.mode ?? this.rowDecoder?.mode ?? this.idctKernel?.mode ?? "uninitialized";
   }
