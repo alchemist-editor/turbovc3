@@ -13,6 +13,10 @@ interface DnxWorkerPoolOptions {
   concurrency: number;
   allowedOutputFormats: readonly DnxPixelFormat[];
   workerFactory: DnxWorkerFactory | null;
+  /** The worker module (default `./workers/dnxPacketDecode.worker.js` beside this file). */
+  workerUrl?: URL;
+  /** Absolute URLs the workers load the WebAssembly modules from. */
+  wasmUrls?: { rowDecoder?: string; idctKernel?: string };
 }
 
 interface WorkerSlot {
@@ -56,11 +60,9 @@ export class DnxDecoderWorkerPool {
     if (!options.workerFactory) {
       throw new Error("A DNx worker factory is required for packet-worker decoding.");
     }
+    const workerUrl = options.workerUrl ?? new URL("./workers/dnxPacketDecode.worker.js", import.meta.url);
     const slots = Array.from({ length: options.concurrency }, () => ({
-      worker: options.workerFactory!(
-        "packet",
-        new URL("./workers/dnxPacketDecode.worker.js", import.meta.url)
-      ),
+      worker: options.workerFactory!("packet", workerUrl),
       load: 0,
       failed: false
     }));
@@ -183,7 +185,8 @@ export class DnxDecoderWorkerPool {
       const request: DnxPacketWorkerRequest = {
         type: "init",
         dnxFourCc: options.dnxFourCc,
-        allowedOutputFormats: options.allowedOutputFormats
+        allowedOutputFormats: options.allowedOutputFormats,
+        ...(options.wasmUrls ? { wasmUrls: options.wasmUrls } : {})
       };
       slot.worker.postMessage(request);
     });

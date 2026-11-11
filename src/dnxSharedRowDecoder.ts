@@ -42,19 +42,30 @@ export class DnxSharedRowDecoder {
     this.dequeuedResolve = resolve;
   });
 
-  private constructor(private readonly slots: WorkerSlot[]) {
+  private constructor(
+    private readonly slots: WorkerSlot[],
+    private readonly rowDecoderWasmUrl?: string
+  ) {
     this.concurrency = slots.length;
   }
 
-  static async create(concurrency: number, workerFactory: DnxWorkerFactory): Promise<DnxSharedRowDecoder> {
+  /**
+   * `options.workerUrl` overrides the worker module (default
+   * `./workers/dnxSharedRowDecode.worker.js` beside this file);
+   * `options.rowDecoderWasmUrl` is the absolute URL the workers load the row
+   * decoder from (their default when absent).
+   */
+  static async create(
+    concurrency: number,
+    workerFactory: DnxWorkerFactory,
+    options: { workerUrl?: URL; rowDecoderWasmUrl?: string } = {}
+  ): Promise<DnxSharedRowDecoder> {
+    const workerUrl = options.workerUrl ?? new URL("./workers/dnxSharedRowDecode.worker.js", import.meta.url);
     const slots = Array.from({ length: Math.max(1, concurrency) }, () => ({
-      worker: workerFactory(
-        "shared-row",
-        new URL("./workers/dnxSharedRowDecode.worker.js", import.meta.url)
-      ),
+      worker: workerFactory("shared-row", workerUrl),
       failed: false
     }));
-    const pool = new DnxSharedRowDecoder(slots);
+    const pool = new DnxSharedRowDecoder(slots, options.rowDecoderWasmUrl);
     try {
       await Promise.all(slots.map((slot) => pool.initializeSlot(slot)));
       return pool;
@@ -204,7 +215,9 @@ export class DnxSharedRowDecoder {
       slot.worker.addEventListener("error", (event) => {
         this.failSlot(slot, new Error(event.message || "DNx shared row worker failed."));
       });
-      const request: DnxSharedRowWorkerRequest = { type: "init" };
+      const request: DnxSharedRowWorkerRequest = this.rowDecoderWasmUrl
+        ? { type: "init", rowDecoderWasmUrl: this.rowDecoderWasmUrl }
+        : { type: "init" };
       slot.worker.postMessage(request);
     });
   }

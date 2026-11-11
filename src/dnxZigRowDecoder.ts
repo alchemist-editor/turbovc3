@@ -125,18 +125,25 @@ const ERROR_MESSAGES = [
   "invalid AC VLC"
 ] as const;
 
-let compiledModulePromise: Promise<WebAssembly.Module> | null = null;
+const compiledModules = new Map<string, Promise<WebAssembly.Module>>();
 
-export async function createDnxZigRowDecoder(): Promise<DnxRowDecoder | null> {
+/**
+ * The Zig/WASM row decoder, or null when it cannot load. `wasmUrl` overrides
+ * where the module is fetched from (default `../wasm/generated/` beside dist).
+ */
+export async function createDnxZigRowDecoder(wasmUrl?: string | URL): Promise<DnxRowDecoder | null> {
   try {
-    return await createDnxWasmRowDecoder();
+    return await createDnxWasmRowDecoder(undefined, wasmUrl);
   } catch {
     return null;
   }
 }
 
-export async function createDnxWasmRowDecoder(wasmBytes?: BufferSource): Promise<DnxRowDecoder> {
-  const module = wasmBytes ? await WebAssembly.compile(wasmBytes) : await loadCompiledModule();
+export async function createDnxWasmRowDecoder(
+  wasmBytes?: BufferSource,
+  wasmUrl?: string | URL
+): Promise<DnxRowDecoder> {
+  const module = wasmBytes ? await WebAssembly.compile(wasmBytes) : await loadCompiledModule(wasmUrl);
   const instance = await WebAssembly.instantiate(module, {});
   const exports = instance.exports as unknown as DnxZigWasmExports;
   validateExports(exports);
@@ -377,14 +384,21 @@ function validateExports(exports: Partial<DnxZigWasmExports>): asserts exports i
   }
 }
 
-async function loadCompiledModule(): Promise<WebAssembly.Module> {
-  compiledModulePromise ??= fetch(new URL("../wasm/generated/dnx_row_decoder.wasm", import.meta.url)).then(
-    async (response) => {
+async function loadCompiledModule(wasmUrl?: string | URL): Promise<WebAssembly.Module> {
+  // Resolved on use, not at import: a bundle without a URL base must still load.
+  const defaultUrl = new URL("../wasm/generated/dnx_row_decoder.wasm", import.meta.url);
+  const url = wasmUrl === undefined ? defaultUrl : new URL(wasmUrl, defaultUrl);
+  let compiled = compiledModules.get(url.href);
+  if (!compiled) {
+    compiled = fetch(url).then(async (response) => {
       if (!response.ok) {
         throw new Error(`DNx Zig row decoder request failed with HTTP ${response.status}.`);
       }
       return WebAssembly.compile(await response.arrayBuffer());
-    }
-  );
-  return compiledModulePromise;
+    });
+    // A failed load is not cached, so a later decoder can retry.
+    compiled.catch(() => compiledModules.delete(url.href));
+    compiledModules.set(url.href, compiled);
+  }
+  return compiled;
 }

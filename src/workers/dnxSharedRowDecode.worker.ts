@@ -18,7 +18,7 @@ workerScope.onmessage = (event) => {
 
 async function handleRequest(request: DnxSharedRowWorkerRequest): Promise<void> {
   if (request.type === "init") {
-    decoder = await createDnxZigRowDecoder();
+    decoder = await createDnxZigRowDecoder(request.rowDecoderWasmUrl);
     if (!decoder) {
       post({ type: "error", message: "The Zig/WASM DNx row decoder could not be initialized." });
       return;

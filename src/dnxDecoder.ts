@@ -18,7 +18,12 @@ import { convertDnxFrameLayout, selectDnxOutputFormat } from "./dnxPixelConversi
 import { DnxSharedRowDecoder } from "./dnxSharedRowDecoder.js";
 import { createDnxZigRowDecoder, type DnxRowDecoder } from "./dnxZigRowDecoder.js";
 import { DnxDecoderWorkerPool } from "./dnxDecoderWorkerPool.js";
-import type { DnxWorkerFactory } from "./dnxWorker.js";
+import type {
+  DnxWasmUrls,
+  DnxWorkerFactory,
+  DnxWorkerStartError,
+  DnxWorkerUrls
+} from "./dnxWorker.js";
 
 export type DnxPixelFormat = Extract<
   DecodePixelFormat,
@@ -41,6 +46,16 @@ export interface DecoderOptions {
   concurrency?: number;
   allowedOutputFormats?: readonly DnxPixelFormat[];
   workerFactory?: DnxWorkerFactory;
+  /** Where to fetch the WebAssembly modules from (see {@link DnxWasmUrls}). */
+  wasmUrls?: DnxWasmUrls;
+  /** Worker module URLs (see {@link DnxWorkerUrls}). */
+  workerUrls?: DnxWorkerUrls;
+  /**
+   * Called when a worker backend fails to start. The decoder still falls back
+   * (shared-row workers, then packet workers, then the calling thread); this
+   * reports why instead of swallowing it.
+   */
+  onWorkerStartError?: (error: DnxWorkerStartError) => void;
 }
 
 interface ResolvedDecoderOptions {
@@ -412,10 +427,15 @@ export class Decoder implements AsyncDisposable {
       try {
         const sharedRowDecoder = await DnxSharedRowDecoder.create(
           Math.max(1, resolvedOptions.concurrency),
-          workerFactory
+          workerFactory,
+          {
+            workerUrl: absoluteUrl(options.workerUrls?.sharedRow),
+            rowDecoderWasmUrl: absoluteUrl(options.wasmUrls?.rowDecoder)?.href
+          }
         );
         return new Decoder(resolvedOptions, null, null, sharedRowDecoder, null);
-      } catch {
+      } catch (error) {
+        reportWorkerStartError(options, "shared-row", error);
         // A page can satisfy the shared-memory capability checks while its row
         // worker module is temporarily unavailable (for example during a Vite
         // restart). Retry with the ordinary packet/scalar backends instead of
@@ -426,14 +446,22 @@ export class Decoder implements AsyncDisposable {
     if (resolvedOptions.concurrency > 0 && workerFactory) {
       try {
         const workerPoolOptions = { ...resolvedOptions, useSharedMemory: false };
-        const workerPool = await DnxDecoderWorkerPool.create(workerPoolOptions);
+        const workerPool = await DnxDecoderWorkerPool.create({
+          ...workerPoolOptions,
+          workerUrl: absoluteUrl(options.workerUrls?.packet),
+          wasmUrls: absoluteWasmUrls(options.wasmUrls)
+        });
         return new Decoder(workerPoolOptions, null, null, null, workerPool);
-      } catch {
+      } catch (error) {
+        reportWorkerStartError(options, "packet", error);
         // Fall through to the synchronous backend when nested workers are unavailable.
       }
     }
 
-    const [idctKernel, rowDecoder] = await Promise.all([createDnxIdctKernel(), createDnxZigRowDecoder()]);
+    const [idctKernel, rowDecoder] = await Promise.all([
+      createDnxIdctKernel(absoluteUrl(options.wasmUrls?.idctKernel)),
+      createDnxZigRowDecoder(absoluteUrl(options.wasmUrls?.rowDecoder))
+    ]);
     return new Decoder(resolvedOptions, idctKernel, rowDecoder, null, null);
   }
 
@@ -600,6 +628,36 @@ function reusableScalarFrameBuffer(
     return undefined;
   }
   return frame.layout?.planes[0]?.bytes.buffer;
+}
+
+/** `url` made absolute against the page (or the calling worker); undefined stays undefined. */
+function absoluteUrl(url: string | URL | undefined): URL | undefined {
+  if (url === undefined) {
+    return undefined;
+  }
+  const base = (globalThis as { location?: { href?: string } }).location?.href ?? import.meta.url;
+  return new URL(url, base);
+}
+
+function absoluteWasmUrls(urls: DnxWasmUrls | undefined): { rowDecoder?: string; idctKernel?: string } | undefined {
+  if (!urls) {
+    return undefined;
+  }
+  return {
+    ...(urls.rowDecoder !== undefined ? { rowDecoder: absoluteUrl(urls.rowDecoder)?.href } : {}),
+    ...(urls.idctKernel !== undefined ? { idctKernel: absoluteUrl(urls.idctKernel)?.href } : {})
+  };
+}
+
+function reportWorkerStartError(options: DecoderOptions, backend: "shared-row" | "packet", error: unknown): void {
+  if (!options.onWorkerStartError) {
+    return;
+  }
+  try {
+    options.onWorkerStartError({ backend, error: error instanceof Error ? error : new Error(String(error)) });
+  } catch {
+    // A reporting hook must never change which backend is chosen.
+  }
 }
 
 function browserWorkerFactory(): DnxWorkerFactory | null {
