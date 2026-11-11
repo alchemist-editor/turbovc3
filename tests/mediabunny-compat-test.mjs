@@ -120,7 +120,9 @@ try {
 }
 
 // A decoder whose workers die mid-lease never frees capacity: decode() must
-// reject (and mark the lease failed) instead of waiting for it forever.
+// report the failure (and close the decoder) instead of waiting forever, and
+// must not reject, which would surface as an unhandled rejection when a later
+// Mediabunny releases close() through its poisoned call serializer.
 {
   const dying = [];
   module.setSharedDecoderFactoryForTests(async () => {
@@ -157,6 +159,9 @@ try {
     source: new module.BufferSource(bytes)
   });
   let guard;
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
   try {
     const track = await dyingInput.getPrimaryVideoTrack();
     const sink = new module.VideoSampleSink(track);
@@ -167,13 +172,16 @@ try {
     for (let i = 0; i < 50 && module.sharedDecoderPoolStats().discarded === before; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    // Mediabunny never closes a decoder whose decode() rejected, so the lease
-    // must already be back: closed as failed, nothing leased or idle.
+    // The lease is back at once, closed as failed: nothing leased or idle.
     assert.equal(module.sharedDecoderPoolStats().discarded, before + 1);
     assert.equal(dying[0].isClosed, true);
     const { discarded: _d, ...pool } = module.sharedDecoderPoolStats();
     assert.deepEqual(pool, { decoders: 0, leases: 0, idle: 0 });
+    // Let Mediabunny finish closing its decoder, then check nothing escaped.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(unhandled.map(String), []);
   } finally {
+    process.off("unhandledRejection", onUnhandled);
     clearTimeout(guard);
     dyingInput.dispose();
     module.setSharedDecoderFactoryForTests(null);
