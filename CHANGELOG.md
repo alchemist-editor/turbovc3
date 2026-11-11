@@ -11,7 +11,7 @@ All notable changes to turbovc3 will be documented here.
   it behaves as before.
 - Mediabunny DNx decoders reuse turbovc3 decoders and their worker pools (`acquireSharedDecoder`): a released decoder
   waits briefly for the next one of the same configuration, instead of a new pool per `getSample()` call. Decoders in
-  use at the same time are never shared.
+  use at the same time are never shared. A decoder whose lease saw a decode rejection is closed instead of reused.
 - `Decoder.create` options `wasmUrls`, `workerUrls` and `onWorkerStartError`.
 
 - A maintained local browser example covering MXF file open, decode, Canvas2D playback, PCM audio clocking, seeking,
