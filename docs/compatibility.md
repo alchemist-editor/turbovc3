@@ -24,7 +24,9 @@ a guarded extension shim; registration fails before changing global state if the
 MXF opens accept lower caller-provided limits. Defaults cap a metadata value at 64 MiB, metadata sets at 100,000,
 KLV packets and output packets at 2,000,000 each, tracks at 1,024, resynchronization work at 16 MiB, dimensions at
 16,384×16,384, and a frame at 268,435,456 pixels. The native Zig ABI separately validates its published packet,
-row, frame, macroblock-width, and row-count capacities before any memory access.
+row, frame, macroblock-width, and row-count capacities before any memory access. A shared-row worker copies at most
+the 1 MiB row buffer of a row: the largest row any supported CID can code is smaller, and only the last row's span
+(which runs over the frame's padding) is longer.
 
 Treat media as untrusted input. CI includes deterministic malformed DNx/MXF corpora, mutation smoke tests, C
 ASan/UBSan, Zig Debug safety checks, and typed worker-error propagation, but this experimental package has not had an

@@ -21,4 +21,13 @@ export type DnxSharedRowWorkerRequest =
 export type DnxSharedRowWorkerResponse =
   | { type: "ready"; mode: string }
   | { type: "decoded-row"; requestId: number }
-  | { type: "error"; requestId?: number; message: string };
+  | {
+      type: "error";
+      requestId?: number;
+      message: string;
+      /**
+       * The row's coded data does not end within the Zig row buffer; packet
+       * workers, which hold the whole packet, may still decode the frame.
+       */
+      capacityExceeded?: boolean;
+    };
