@@ -288,6 +288,38 @@
       "tracks": [
         "video"
       ]
+    },
+    {
+      "path": "dnxhr_hqx_2160p30_testsrc.mov.gz",
+      "sha256": "7ef43160aed8a7296f24d3bfbad3339ae6c55a6d60638fa3b7da250a74ed8b2f",
+      "cid": 1271,
+      "width": 3840,
+      "height": 2160,
+      "pixelFormat": "yuv422p10"
+    },
+    {
+      "path": "dnxhr_hq_2160p30_testsrc.mov.gz",
+      "sha256": "d0fd25482e8bc21d3ee01a23bd54084c7b37bf5db4439464081d629170a60df1",
+      "cid": 1272,
+      "width": 3840,
+      "height": 2160,
+      "pixelFormat": "yuv422p8"
+    },
+    {
+      "path": "dnxhr_444_2160p30_testsrc.mov.gz",
+      "sha256": "eff60b7a108b67b5f39f0489a399e5692f2155252e0db1eb35fb5170a5ea7d23",
+      "cid": 1270,
+      "width": 3840,
+      "height": 2160,
+      "pixelFormat": "yuv444p10"
+    },
+    {
+      "path": "dnxhr_hqx_4320p30_smptehdbars.mov.gz",
+      "sha256": "d7a46387276fb7e6bcb1222c6be19ca5371c04036c59364b03a2e5f340fbcc39",
+      "cid": 1271,
+      "width": 7680,
+      "height": 4320,
+      "pixelFormat": "yuv422p10"
     }
   ]
 }

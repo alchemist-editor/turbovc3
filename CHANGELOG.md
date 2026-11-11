@@ -92,6 +92,9 @@ All notable changes to turbovc3 will be documented here.
 
 ### Fixed
 
+- 2160p DNxHR (HQ, HQX, 444) decodes on shared-memory row workers. DNxHR frames are padded to a fixed size and the
+  last row's span runs to the end of the payload, megabytes past the 1 MiB Zig row buffer; a row worker now copies
+  at most the buffer, since decoding stops after the row's macroblocks (#23).
 - `closeSharedDecoders()` while a lease is out no longer lets that lease's later release park its decoder again; the
   decoder closes on release.
 - `Decoder.isUsable` reports whether a decoder can still decode; it is false once closed or once every packet or

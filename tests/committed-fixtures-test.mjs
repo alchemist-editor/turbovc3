@@ -52,7 +52,11 @@ const requiredFiles = [
   "oracle_dnxhr_444_gbr_1080p30_10bit.yuv.gz",
   "dnxhr-lb-op1a-pcm.mxf",
   "dnxhr-lb-op1a-pcm24-mono-24fps-tc.mxf",
-  "dnxhr-lb-opatom.mxf"
+  "dnxhr-lb-opatom.mxf",
+  "dnxhr_hqx_2160p30_testsrc.mov.gz",
+  "dnxhr_hq_2160p30_testsrc.mov.gz",
+  "dnxhr_444_2160p30_testsrc.mov.gz",
+  "dnxhr_hqx_4320p30_smptehdbars.mov.gz"
 ];
 const manifestPaths = new Set(manifest.files.map((fixture) => fixture.path));
 for (const requiredFile of requiredFiles) {
