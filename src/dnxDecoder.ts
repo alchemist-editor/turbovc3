@@ -15,7 +15,7 @@ import {
 import { createDnxIdctKernel, type DnxIdctKernel, type DnxIdctMode } from "./dnxIdctKernel.js";
 import { decodeDnxScalarFrame, supportsDnxScalarCid } from "./dnxScalarDecoder.js";
 import { convertDnxFrameLayout, selectDnxOutputFormat } from "./dnxPixelConversion.js";
-import { DnxSharedRowDecoder } from "./dnxSharedRowDecoder.js";
+import { DnxRowCapacityError, DnxSharedRowDecoder } from "./dnxSharedRowDecoder.js";
 import { createDnxZigRowDecoder, type DnxRowDecoder } from "./dnxZigRowDecoder.js";
 import { DnxDecoderWorkerPool } from "./dnxDecoderWorkerPool.js";
 import type {
@@ -53,7 +53,9 @@ export interface DecoderOptions {
   /**
    * Called when a worker backend fails to start. The decoder still falls back
    * (shared-row workers, then packet workers, then the calling thread); this
-   * reports why instead of swallowing it.
+   * reports why instead of swallowing it. Also called, with backend
+   * `"shared-row"`, when a frame does not fit the row workers' buffers and the
+   * decoder moves to packet workers for it and later frames.
    */
   onWorkerStartError?: (error: DnxWorkerStartError) => void;
 }
@@ -370,13 +372,18 @@ export class Decoder implements AsyncDisposable {
   readonly allowedOutputFormats: readonly DnxPixelFormat[];
   private closed = false;
   private closePromise: Promise<void> | null = null;
+  private packetFallback: Promise<DnxDecoderWorkerPool | null> | null = null;
+  private retiredRowDecoder: Promise<void> | null = null;
 
   private constructor(
     options: ResolvedDecoderOptions,
     private readonly idctKernel: DnxIdctKernel | null,
     private readonly rowDecoder: DnxRowDecoder | null,
-    private readonly sharedRowDecoder: DnxSharedRowDecoder | null,
-    private readonly workerPool: DnxDecoderWorkerPool | null
+    private sharedRowDecoder: DnxSharedRowDecoder | null,
+    private workerPool: DnxDecoderWorkerPool | null,
+    /** Starts packet workers for frames the row workers cannot hold (shared-row backend only). */
+    private readonly startPacketWorkers: (() => Promise<DnxDecoderWorkerPool>) | null = null,
+    private readonly onWorkerStartError?: DecoderOptions["onWorkerStartError"]
   ) {
     this.dnxFourCc = options.dnxFourCc;
     this.useSharedMemory = options.useSharedMemory;
@@ -446,9 +453,24 @@ export class Decoder implements AsyncDisposable {
             rowDecoderWasmUrl: absoluteUrl(options.wasmUrls?.rowDecoder)?.href
           }
         );
-        return new Decoder(resolvedOptions, null, null, sharedRowDecoder, null);
+        const startPacketWorkers = resolvedOptions.concurrency > 0
+          ? () => DnxDecoderWorkerPool.create({
+              ...resolvedOptions,
+              workerUrl: absoluteUrl(options.workerUrls?.packet),
+              wasmUrls: absoluteWasmUrls(options.wasmUrls)
+            })
+          : null;
+        return new Decoder(
+          resolvedOptions,
+          null,
+          null,
+          sharedRowDecoder,
+          null,
+          startPacketWorkers,
+          options.onWorkerStartError
+        );
       } catch (error) {
-        reportWorkerStartError(options, "shared-row", error);
+        reportWorkerStartError(options.onWorkerStartError, "shared-row", error);
         // A page can satisfy the shared-memory capability checks while its row
         // worker module is temporarily unavailable (for example during a Vite
         // restart). Retry with the ordinary packet/scalar backends instead of
@@ -466,7 +488,7 @@ export class Decoder implements AsyncDisposable {
         });
         return new Decoder(workerPoolOptions, null, null, null, workerPool);
       } catch (error) {
-        reportWorkerStartError(options, "packet", error);
+        reportWorkerStartError(options.onWorkerStartError, "packet", error);
         // Fall through to the synchronous backend when nested workers are unavailable.
       }
     }
@@ -560,7 +582,17 @@ export class Decoder implements AsyncDisposable {
           populateDecodedFrame(frame, header, layout, outputPixelFormat);
           return frame as FilledFrame;
         } catch (error) {
-          return decodeErrorFrom(error);
+          const packetWorkers = error instanceof DnxRowCapacityError
+            ? await this.fallBackToPacketWorkers(error)
+            : null;
+          if (!packetWorkers) {
+            return decodeErrorFrom(error);
+          }
+          try {
+            return await packetWorkers.decode(packetData, frame, options);
+          } catch (packetError) {
+            return decodeErrorFrom(packetError);
+          }
         }
       }
 
@@ -611,9 +643,12 @@ export class Decoder implements AsyncDisposable {
 
     this.closed = true;
     this.closePromise = (async () => {
+      // A fallback still starting resolves to null once closed is set.
+      await this.packetFallback;
       await Promise.all([
         this.workerPool?.close(),
-        this.sharedRowDecoder?.close()
+        this.sharedRowDecoder?.close(),
+        this.retiredRowDecoder
       ]);
       this.rowDecoder?.destroy();
       this.idctKernel?.destroy();
@@ -623,6 +658,36 @@ export class Decoder implements AsyncDisposable {
 
   [Symbol.asyncDispose](): Promise<void> {
     return this.close();
+  }
+
+  /**
+   * A frame did not fit the row workers' buffers: report it through
+   * onWorkerStartError and move this decoder to packet workers, which hold a
+   * whole packet. Started once; null when there are none to move to.
+   */
+  private fallBackToPacketWorkers(cause: DnxRowCapacityError): Promise<DnxDecoderWorkerPool | null> {
+    this.packetFallback ??= (async () => {
+      reportWorkerStartError(this.onWorkerStartError, "shared-row", cause);
+      if (!this.startPacketWorkers || this.closed) {
+        return null;
+      }
+      let packetWorkers: DnxDecoderWorkerPool;
+      try {
+        packetWorkers = await this.startPacketWorkers();
+      } catch (error) {
+        reportWorkerStartError(this.onWorkerStartError, "packet", error);
+        return null;
+      }
+      if (this.closed) {
+        await packetWorkers.close();
+        return null;
+      }
+      this.retiredRowDecoder = this.sharedRowDecoder?.close() ?? null;
+      this.sharedRowDecoder = null;
+      this.workerPool = packetWorkers;
+      return packetWorkers;
+    })();
+    return this.packetFallback;
   }
 }
 
@@ -662,12 +727,16 @@ function absoluteWasmUrls(urls: DnxWasmUrls | undefined): { rowDecoder?: string;
   };
 }
 
-function reportWorkerStartError(options: DecoderOptions, backend: "shared-row" | "packet", error: unknown): void {
-  if (!options.onWorkerStartError) {
+function reportWorkerStartError(
+  onWorkerStartError: DecoderOptions["onWorkerStartError"],
+  backend: "shared-row" | "packet",
+  error: unknown
+): void {
+  if (!onWorkerStartError) {
     return;
   }
   try {
-    options.onWorkerStartError({ backend, error: error instanceof Error ? error : new Error(String(error)) });
+    onWorkerStartError({ backend, error: error instanceof Error ? error : new Error(String(error)) });
   } catch {
     // A reporting hook must never change which backend is chosen.
   }

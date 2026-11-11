@@ -11,6 +11,17 @@ import type {
 } from "./dnxSharedRowWorkerProtocol.js";
 import type { DnxWorker, DnxWorkerFactory } from "./dnxWorker.js";
 
+/**
+ * A frame the row workers cannot decode within the Zig decoder's fixed
+ * buffers; packet workers may still decode it.
+ */
+export class DnxRowCapacityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DnxRowCapacityError";
+  }
+}
+
 interface WorkerSlot {
   worker: DnxWorker;
   failed: boolean;
@@ -239,9 +250,8 @@ export class DnxSharedRowDecoder {
     if (response.type === "decoded-row") {
       pending.resolve();
     } else {
-      pending.reject(new Error(
-        `DNx shared row ${pending.row} request ${response.requestId}: ${response.message}`
-      ));
+      const message = `DNx shared row ${pending.row} request ${response.requestId}: ${response.message}`;
+      pending.reject(response.capacityExceeded ? new DnxRowCapacityError(message) : new Error(message));
     }
   }
 
