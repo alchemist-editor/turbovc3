@@ -96,7 +96,8 @@ All notable changes to turbovc3 will be documented here.
   last row's span runs to the end of the payload, megabytes past the 1 MiB Zig row buffer; a row worker now copies
   at most the buffer, since decoding stops after the row's macroblocks (#23).
 - A frame that fails on shared-row workers now waits for all of its rows before the next frame starts, so its
-  leftover rows can no longer write into a reused `Frame`'s buffer while the next frame decodes into it.
+  leftover rows can no longer write into a reused `Frame`'s buffer while the next frame decodes into it. When a row
+  worker dies, only that worker's rows fail at once; rows on the other workers finish first.
 - `closeSharedDecoders()` while a lease is out no longer lets that lease's later release park its decoder again; the
   decoder closes on release.
 - `Decoder.isUsable` reports whether a decoder can still decode; it is false once closed or once every packet or
