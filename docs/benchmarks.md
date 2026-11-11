@@ -23,3 +23,19 @@ CI runs a two-iteration structural smoke test. It deliberately does not impose w
 GitHub runners. Performance comparisons are meaningful only on the same machine, power mode, runtime version, and
 iteration count. Capture those fields with the JSON result when investigating a regression; named baseline hardware
 and release-blocking budgets remain future qualification work.
+
+## WebAssembly build flags
+
+`scripts/build-dnx-zig-wasm.sh` builds the Zig row decoder with `-O ReleaseFast -fstrip` and
+`scripts/build-dnx-wasm.sh` builds the IDCT kernel with `-O3 -msimd128`. Both were chosen from one comparison
+(Apple M4 Pro, Chromium, DNxHR HQ 1080p30, medians of three runs on a machine under load, 2026-11-11); every
+variant passed `npm run test:native`.
+
+| Row decoder build | Size | Decode fps per layer at 1 / 2 / 4 / 8 concurrent layers | Node frame decode fps |
+| --- | --- | --- | --- |
+| `-O ReleaseFast -fstrip` | 29 KB | 176.6 / 169.3 / 110.8 / 49.0 | 231 |
+| `-O ReleaseSmall` | 20 KB | 141.7 / 139.8 / 88.2 / 45.2 | 205 |
+
+Without `-fstrip`, ReleaseFast keeps its debug sections and the file is 834 KB. The row decoder build is
+reproducible: Zig 0.17.0 on macOS and on Linux produce the same bytes. The IDCT kernel, which runs only when the
+row decoder is unavailable, measured 41.2 fps with `-msimd128` and 39.2 without in Node.
