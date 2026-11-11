@@ -14,7 +14,7 @@ import {
   type EncodedPacket,
   type VideoCodec
 } from "mediabunny";
-import { Decoder, Frame, type FilledFrame } from "./dnxDecoder.js";
+import { Decoder, DnxDecoderError, Frame, type FilledFrame } from "./dnxDecoder.js";
 import { acquireSharedDecoder, type SharedDecoderLease } from "./dnxSharedDecoderPool.js";
 import type { DnxWasmUrls, DnxWorkerStartError, DnxWorkerUrls } from "./dnxWorker.js";
 import {
@@ -217,6 +217,16 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
   async decode(packet: EncodedPacket): Promise<void> {
     const decoder = this.requireDecoder();
     while (decoder.desiredSize <= 0) {
+      if (!decoder.isUsable) {
+        // Its workers died: no capacity will ever free up, so waiting would
+        // hang. Mediabunny's call serializer skips flush() and close() after a
+        // rejected decode(), so hand the decoder back here, as failed (closed).
+        this.lease?.markFailed();
+        this.lease?.release();
+        this.lease = null;
+        this.decoder = null;
+        throw new DnxDecoderError("DNx decoder can no longer decode: its workers failed.");
+      }
       await decoder.dequeued;
     }
 

@@ -94,6 +94,10 @@ All notable changes to turbovc3 will be documented here.
 
 - `closeSharedDecoders()` while a lease is out no longer lets that lease's later release park its decoder again; the
   decoder closes on release.
+- `Decoder.isUsable` reports whether a decoder can still decode; it is false once closed or once every packet or
+  shared-row worker has failed. The shared decoder pool closes such a decoder instead of handing it out from idle
+  (counted in `sharedDecoderPoolStats().discarded`), and a Mediabunny decode waiting for capacity on one now rejects
+  and gives the decoder back instead of waiting forever.
 
 ### Changed
 

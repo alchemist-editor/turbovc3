@@ -54,7 +54,8 @@ Mediabunny builds a new custom decoder for each `VideoSampleSink.getSample()` ca
 `idleCloseMs` (default 1000 ms) for the next one of the same configuration, so a run of seeks reuses one worker pool,
 then closes and terminates its workers. At most `maxIdleDecoders` (default 4) wait per configuration. Decoders in use
 at the same time are never shared: a shared-memory row decoder decodes one frame at a time, so several players on one
-would fall below real time. `acquireSharedDecoder` exposes the same pool to callers that manage decoders themselves;
+would fall below real time. A decoder whose workers all died (`Decoder.isUsable` false) is closed rather than reused.
+`acquireSharedDecoder` exposes the same pool to callers that manage decoders themselves;
 `sharedDecoderPoolStats` and `closeSharedDecoders` support diagnostics and teardown.
 
 ## Vite

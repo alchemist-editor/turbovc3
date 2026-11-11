@@ -82,6 +82,7 @@ try {
   module.setSharedDecoderFactoryForTests(async () => {
     const decoder = {
       isClosed: false,
+      isUsable: true,
       desiredSize: 1,
       decodeQueueSize: 0,
       dequeued: Promise.resolve(),
@@ -113,6 +114,68 @@ try {
     assert.equal(module.sharedDecoderPoolStats().idle, 0);
   } finally {
     failInput.dispose();
+    module.setSharedDecoderFactoryForTests(null);
+    module.registerDnxDecoder({});
+  }
+}
+
+// A decoder whose workers die mid-lease never frees capacity: decode() must
+// reject (and mark the lease failed) instead of waiting for it forever.
+{
+  const dying = [];
+  module.setSharedDecoderFactoryForTests(async () => {
+    let died = null;
+    const decoder = {
+      isClosed: false,
+      isUsable: true,
+      // Full, and capacity never returns once the workers are gone.
+      desiredSize: 0,
+      decodeQueueSize: 0,
+      get dequeued() {
+        // The first wait ends when the last worker dies; later waits never end,
+        // like a worker pool with no workers left.
+        died ??= new Promise((resolve) => setTimeout(() => {
+          decoder.isUsable = false;
+          resolve();
+        }, 10));
+        return decoder.isUsable ? died : new Promise(() => {});
+      },
+      async decode() {
+        throw new Error("decode should not be reached");
+      },
+      async close() {
+        decoder.isClosed = true;
+      }
+    };
+    dying.push(decoder);
+    return decoder;
+  });
+  module.registerDnxDecoder({ useSharedMemory: false, idleCloseMs: 60_000 });
+  const before = module.sharedDecoderPoolStats().discarded;
+  const dyingInput = new module.Input({
+    formats: [new module.QuickTimeInputFormat()],
+    source: new module.BufferSource(bytes)
+  });
+  let guard;
+  try {
+    const track = await dyingInput.getPrimaryVideoTrack();
+    const sink = new module.VideoSampleSink(track);
+    const hung = new Promise((_, reject) => {
+      guard = setTimeout(() => reject(new Error("decode() hung on a decoder whose workers died")), 2000);
+    });
+    await assert.rejects(Promise.race([sink.getSample(0), hung]), /can no longer decode/);
+    for (let i = 0; i < 50 && module.sharedDecoderPoolStats().discarded === before; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // Mediabunny never closes a decoder whose decode() rejected, so the lease
+    // must already be back: closed as failed, nothing leased or idle.
+    assert.equal(module.sharedDecoderPoolStats().discarded, before + 1);
+    assert.equal(dying[0].isClosed, true);
+    const { discarded: _d, ...pool } = module.sharedDecoderPoolStats();
+    assert.deepEqual(pool, { decoders: 0, leases: 0, idle: 0 });
+  } finally {
+    clearTimeout(guard);
+    dyingInput.dispose();
     module.setSharedDecoderFactoryForTests(null);
     module.registerDnxDecoder({});
   }
