@@ -1,7 +1,11 @@
 import type { DnxFrameHeader } from "./dnxFrame.js";
 
 export type DnxSharedRowWorkerRequest =
-  | { type: "init" }
+  | {
+      type: "init";
+      /** Absolute URL of dnx_row_decoder.wasm; the worker's default when absent. */
+      rowDecoderWasmUrl?: string;
+    }
   | {
       type: "decode-row";
       requestId: number;

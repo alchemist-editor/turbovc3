@@ -21,7 +21,8 @@ async function handleRequest(request: DnxPacketWorkerRequest): Promise<void> {
       dnxFourCc: request.dnxFourCc,
       allowedOutputFormats: request.allowedOutputFormats,
       useSharedMemory: false,
-      concurrency: 0
+      concurrency: 0,
+      wasmUrls: request.wasmUrls
     });
     if (created instanceof Error) {
       post({ type: "error", message: created.message });

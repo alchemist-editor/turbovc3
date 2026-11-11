@@ -6,6 +6,8 @@ export interface DnxPacketWorkerInitRequest {
   type: "init";
   dnxFourCc: DnxFourCc;
   allowedOutputFormats: readonly DnxPixelFormat[];
+  /** Absolute URLs of the WebAssembly modules; the worker's defaults when absent. */
+  wasmUrls?: { rowDecoder?: string; idctKernel?: string };
 }
 
 export interface DnxPacketWorkerDecodeRequest {

@@ -24,18 +24,25 @@ interface DnxWasmFunctions {
   transform(coefficients: number, samples: number, blockCount: number, bitDepth: number): void;
 }
 
-let compiledModulePromise: Promise<WebAssembly.Module> | null = null;
+const compiledModules = new Map<string, Promise<WebAssembly.Module>>();
 
-export async function createDnxIdctKernel(): Promise<DnxIdctKernel> {
+/**
+ * The WASM IDCT kernel, or the TypeScript one when it cannot load. `wasmUrl`
+ * overrides where the module is fetched from (default `../wasm/generated/`).
+ */
+export async function createDnxIdctKernel(wasmUrl?: string | URL): Promise<DnxIdctKernel> {
   try {
-    return await createDnxWasmIdctKernel();
+    return await createDnxWasmIdctKernel(undefined, wasmUrl);
   } catch {
     return new DnxTypescriptIdctKernel();
   }
 }
 
-export async function createDnxWasmIdctKernel(wasmBytes?: BufferSource): Promise<DnxIdctKernel> {
-  const module = wasmBytes ? await WebAssembly.compile(wasmBytes) : await loadCompiledModule();
+export async function createDnxWasmIdctKernel(
+  wasmBytes?: BufferSource,
+  wasmUrl?: string | URL
+): Promise<DnxIdctKernel> {
+  const module = wasmBytes ? await WebAssembly.compile(wasmBytes) : await loadCompiledModule(wasmUrl);
   const instance = await WebAssembly.instantiate(module, {
     env: {
       emscripten_notify_memory_growth() {}
@@ -144,16 +151,22 @@ class DnxWasmIdctKernel implements DnxIdctKernel {
   }
 }
 
-async function loadCompiledModule(): Promise<WebAssembly.Module> {
-  compiledModulePromise ??= fetch(new URL("../wasm/generated/dnx_idct_kernel.wasm", import.meta.url)).then(
-    async (response) => {
+async function loadCompiledModule(wasmUrl?: string | URL): Promise<WebAssembly.Module> {
+  // Resolved on use, not at import: a bundle without a URL base must still load.
+  const defaultUrl = new URL("../wasm/generated/dnx_idct_kernel.wasm", import.meta.url);
+  const url = wasmUrl === undefined ? defaultUrl : new URL(wasmUrl, defaultUrl);
+  let compiled = compiledModules.get(url.href);
+  if (!compiled) {
+    compiled = fetch(url).then(async (response) => {
       if (!response.ok) {
         throw new Error(`DNx WASM IDCT kernel request failed with HTTP ${response.status}.`);
       }
       return WebAssembly.compile(await response.arrayBuffer());
-    }
-  );
-  return compiledModulePromise;
+    });
+    compiled.catch(() => compiledModules.delete(url.href));
+    compiledModules.set(url.href, compiled);
+  }
+  return compiled;
 }
 
 function readWasmFunctions(exports: DnxWasmExports): DnxWasmFunctions {
