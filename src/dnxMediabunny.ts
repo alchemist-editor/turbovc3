@@ -211,6 +211,9 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     this.decoder = lease.decoder;
   }
 
+  // flush() and close() rely on Mediabunny serializing custom decoder calls
+  // (one CallSerializer for decode, flush and close), so a decode has always
+  // chained onto emissionTail before a later flush or close runs.
   async decode(packet: EncodedPacket): Promise<void> {
     const decoder = this.requireDecoder();
     while (decoder.desiredSize <= 0) {
