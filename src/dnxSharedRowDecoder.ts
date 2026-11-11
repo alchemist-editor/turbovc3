@@ -166,7 +166,10 @@ export class DnxSharedRowDecoder {
       : new SharedArrayBuffer(frameByteLength);
     const layout = createDnxFrameLayout(header, frameBuffer);
 
-    await Promise.all(rows.map((row, index) => {
+    // Wait for every row, not just the first failure: the next frame may reuse
+    // this frame buffer and overwrites the shared packet buffer, so none of
+    // this frame's rows may still be running when the queue moves on.
+    const settled = await Promise.allSettled(rows.map((row, index) => {
       const slot = availableSlots[index % availableSlots.length];
       const requestId = this.nextRequestId++;
       return new Promise<void>((resolve, reject) => {
@@ -189,6 +192,10 @@ export class DnxSharedRowDecoder {
         }
       });
     }));
+    const failure = settled.find((result) => result.status === "rejected");
+    if (failure) {
+      throw failure.reason;
+    }
 
     return { layout, frameBuffer };
   }
