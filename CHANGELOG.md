@@ -90,6 +90,11 @@ All notable changes to turbovc3 will be documented here.
   JavaScript-side rejection before native memory access and maximum-envelope tests.
 - Native C IDCT ASan/UBSan coverage and Debug-mode Zig safety tests, including oversized-argument arithmetic checks.
 
+### Fixed
+
+- `closeSharedDecoders()` while a lease is out no longer lets that lease's later release park its decoder again; the
+  decoder closes on release.
+
 ### Changed
 
 - Random-access frames now preserve pixel aspect ratio and report woven interlaced scan state instead of always

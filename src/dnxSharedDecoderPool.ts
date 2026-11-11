@@ -166,18 +166,22 @@ function dropIfEmpty(key: string, bucket: Bucket): void {
   }
 }
 
-/** Close every idle decoder now (page teardown, tests). Leased decoders close when released. */
+/**
+ * Close every idle decoder now (page teardown, tests). Leased decoders close
+ * when released: every bucket leaves the map, so park() no longer finds a
+ * released decoder's bucket and closes it instead of parking it.
+ */
 export async function closeSharedDecoders(): Promise<void> {
   const closing: Promise<void>[] = [];
-  for (const [key, bucket] of [...buckets]) {
+  for (const bucket of buckets.values()) {
     for (const idle of bucket.idle.splice(0)) {
       if (idle.timer !== null) {
         clearTimeout(idle.timer);
       }
       closing.push(idle.decoder.close());
     }
-    dropIfEmpty(key, bucket);
   }
+  buckets.clear();
   await Promise.all(closing);
 }
 

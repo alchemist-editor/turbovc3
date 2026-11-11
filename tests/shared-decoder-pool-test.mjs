@@ -261,4 +261,17 @@ await run("a lease marked failed closes its decoder on release; the next lease b
   again.release();
 });
 
+await run("a decoder released after closeSharedDecoders closes instead of parking", async () => {
+  const workers = fakeWorkers();
+  const options = { ...base, workerFactory: workers.factory, idleCloseMs: 60_000 };
+  const lease = await acquireSharedDecoder(options);
+  assert.ok(!(lease instanceof Error));
+  await closeSharedDecoders();
+  lease.release();
+  await sleep(0);
+  assert.equal(lease.decoder.isClosed, true);
+  assert.equal(workers.live.size, 0);
+  assert.equal(sharedDecoderPoolStats().idle, 0);
+});
+
 console.log("Shared decoder pool tests passed.");
