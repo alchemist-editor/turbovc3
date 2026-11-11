@@ -3,7 +3,8 @@
 // data: module's import.meta.url cannot resolve the default
 // ../wasm/generated/ path; an override must not need it. The library is
 // bundled and imported from a data: URL, and the modules are served over HTTP
-// (Node's fetch does not read file: URLs).
+// (Node's fetch does not read file: URLs). It needs the built modules in
+// wasm/generated/ (npm run build:wasm), so it runs in test:native.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
