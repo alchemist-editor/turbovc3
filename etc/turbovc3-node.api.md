@@ -1309,6 +1309,7 @@ export interface RegisterDnxDecoderOptions {
 export interface SharedDecoderLease {
     // (undocumented)
     readonly decoder: Decoder;
+    markFailed(): void;
     release(): void;
 }
 
@@ -1321,6 +1322,7 @@ export interface SharedDecoderOptions extends DecoderOptions {
 // @public
 export interface SharedDecoderPoolStats {
     decoders: number;
+    discarded: number;
     idle: number;
     leases: number;
 }

@@ -11,7 +11,9 @@ import { Decoder, type DecoderOptions, type DnxNotSupportedError } from "./dnxDe
  * because a shared-memory row decoder decodes one frame at a time and eight
  * layers through one of them fall far below real time. A released decoder
  * waits idle for the next lease of the same configuration and closes after
- * `idleCloseMs`; at most `maxIdleDecoders` wait per configuration.
+ * `idleCloseMs`; at most `maxIdleDecoders` wait per configuration. A lease
+ * marked failed (a decode rejected, a worker died) closes its decoder on
+ * release instead of parking it, so no later caller inherits a broken one.
  */
 
 export interface SharedDecoderOptions extends DecoderOptions {
@@ -23,6 +25,12 @@ export interface SharedDecoderOptions extends DecoderOptions {
 
 export interface SharedDecoderLease {
   readonly decoder: Decoder;
+  /**
+   * Something went wrong while this lease held the decoder (a decode
+   * rejected, a worker crashed or failed to start): release closes it rather
+   * than parking it for the next lease.
+   */
+  markFailed(): void;
   /** Give the decoder back. Idempotent; it waits for the next lease or closes. */
   release(): void;
 }
@@ -35,6 +43,8 @@ export interface SharedDecoderPoolStats {
   leases: number;
   /** Released decoders waiting for the next lease. */
   idle: number;
+  /** Decoders closed on release because their lease was marked failed, since load. */
+  discarded: number;
 }
 
 export const DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS = 1000;
@@ -54,6 +64,7 @@ interface Bucket {
 }
 
 const buckets = new Map<string, Bucket>();
+let discarded = 0;
 let createDecoder: DecoderCreate = (options) => Decoder.create(options);
 
 /**
@@ -94,14 +105,24 @@ export async function acquireSharedDecoder(
   bucket.leased += 1;
   const leased = decoder;
   let released = false;
+  let failed = false;
   return {
     decoder: leased,
+    markFailed: () => {
+      failed = true;
+    },
     release: () => {
       if (released) {
         return;
       }
       released = true;
       bucket.leased -= 1;
+      if (failed) {
+        discarded += 1;
+        void leased.close();
+        dropIfEmpty(key, bucket);
+        return;
+      }
       park(key, bucket, leased, options);
     }
   };
@@ -169,7 +190,7 @@ export function sharedDecoderPoolStats(): SharedDecoderPoolStats {
     idle += bucket.idle.length;
     starting += bucket.starting;
   }
-  return { decoders: leases + idle + starting, leases, idle };
+  return { decoders: leases + idle + starting, leases, idle, discarded };
 }
 
 /** Tests only: build decoders with `create` instead of `Decoder.create`. */

@@ -47,6 +47,12 @@ function fakeWorkers() {
 
 const base = { dnxFourCc: "AVdh", useSharedMemory: false, concurrency: 2 };
 
+/** Pool counts without the cumulative discard counter. */
+function live() {
+  const { discarded: _discarded, ...rest } = sharedDecoderPoolStats();
+  return rest;
+}
+
 async function run(name, fn) {
   try {
     await fn();
@@ -70,10 +76,10 @@ await run("N decoders one after another reuse one decoder and one worker pool", 
   }
   assert.equal(decoders.size, 1);
   assert.equal(workers.created(), 2, "one pool of two packet workers");
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 1, leases: 0, idle: 1 });
+  assert.deepEqual(live(), { decoders: 1, leases: 0, idle: 1 });
   await closeSharedDecoders();
   assert.equal(workers.live.size, 0);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
+  assert.deepEqual(live(), { decoders: 0, leases: 0, idle: 0 });
 });
 
 await run("concurrent decoders never share one (each player keeps its throughput)", async () => {
@@ -82,7 +88,7 @@ await run("concurrent decoders never share one (each player keeps its throughput
   const leases = await Promise.all(Array.from({ length: 4 }, () => acquireSharedDecoder(options)));
   assert.equal(new Set(leases.map((lease) => lease.decoder)).size, 4);
   assert.equal(workers.created(), 8);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 4, leases: 4, idle: 0 });
+  assert.deepEqual(live(), { decoders: 4, leases: 4, idle: 0 });
   for (const lease of leases) lease.release();
   await sleep(0);
   assert.equal(workers.live.size, 0);
@@ -111,7 +117,7 @@ await run("at most maxIdleDecoders wait per configuration; the rest close at onc
   const leases = await Promise.all(Array.from({ length: 5 }, () => acquireSharedDecoder(options)));
   for (const lease of leases) lease.release();
   await sleep(0);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 2, leases: 0, idle: 2 });
+  assert.deepEqual(live(), { decoders: 2, leases: 0, idle: 2 });
   assert.equal(workers.live.size, 4);
   // The next two leases take the idle decoders; the third builds a new one.
   const again = [await acquireSharedDecoder(options), await acquireSharedDecoder(options)];
@@ -135,7 +141,7 @@ await run("an idle decoder stays warm for the next lease, then closes", async ()
   await sleep(80);
   assert.equal(workers.live.size, 0);
   assert.equal(first.decoder.isClosed, true);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
+  assert.deepEqual(live(), { decoders: 0, leases: 0, idle: 0 });
   // After the close, a new lease builds a new pool.
   const third = await acquireSharedDecoder(options);
   assert.notEqual(third.decoder, first.decoder);
@@ -153,7 +159,7 @@ await run("different configurations get different decoders", async () => {
     idleCloseMs: 0
   });
   assert.notEqual(a.decoder, b.decoder);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 2, leases: 2, idle: 0 });
+  assert.deepEqual(live(), { decoders: 2, leases: 2, idle: 0 });
   a.release();
   b.release();
   await sleep(0);
@@ -171,7 +177,7 @@ await run("a creation error is returned and not cached", async () => {
   const second = await acquireSharedDecoder({ ...base, idleCloseMs: 0 });
   assert.ok(second instanceof Error);
   assert.equal(calls, 2);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
+  assert.deepEqual(live(), { decoders: 0, leases: 0, idle: 0 });
 });
 
 await run("worker and wasm URL options reach the workers as absolute URLs", async () => {
@@ -217,6 +223,42 @@ await run("worker start failures reach onWorkerStartError and the decoder still 
   // The calling-thread backend: no worker prefix.
   assert.ok(!lease.decoder.idctMode.startsWith("worker-pool/"));
   lease.release();
+});
+
+await run("a lease marked failed closes its decoder on release; the next lease builds a new one", async () => {
+  const made = [];
+  setSharedDecoderFactoryForTests(async () => {
+    const decoder = {
+      isClosed: false,
+      closes: 0,
+      async close() {
+        decoder.closes += 1;
+        decoder.isClosed = true;
+      }
+    };
+    made.push(decoder);
+    return decoder;
+  });
+  const options = { ...base, idleCloseMs: 1000 };
+  const before = sharedDecoderPoolStats().discarded;
+  const broken = await acquireSharedDecoder(options);
+  broken.markFailed();
+  broken.release();
+  broken.release();
+  await sleep(0);
+  assert.equal(made[0].closes, 1);
+  assert.equal(sharedDecoderPoolStats().discarded, before + 1);
+  assert.deepEqual(live(), { decoders: 0, leases: 0, idle: 0 });
+  const next = await acquireSharedDecoder(options);
+  assert.notEqual(next.decoder, made[0]);
+  assert.equal(made.length, 2);
+  // A healthy lease is still parked and reused.
+  next.release();
+  const again = await acquireSharedDecoder(options);
+  assert.equal(again.decoder, made[1]);
+  assert.equal(made.length, 2);
+  assert.equal(sharedDecoderPoolStats().discarded, before + 1);
+  again.release();
 });
 
 console.log("Shared decoder pool tests passed.");

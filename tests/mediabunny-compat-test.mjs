@@ -69,9 +69,53 @@ try {
   for (let i = 0; i < 50 && module.sharedDecoderPoolStats().decoders > 0; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.deepEqual(module.sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
+  const { discarded: _discarded, ...pool } = module.sharedDecoderPoolStats();
+  assert.deepEqual(pool, { decoders: 0, leases: 0, idle: 0 });
 } finally {
   seekInput.dispose();
+}
+
+// A decode that rejects marks the lease failed: the decoder is closed on
+// release, not parked for the next getSample().
+{
+  const broken = [];
+  module.setSharedDecoderFactoryForTests(async () => {
+    const decoder = {
+      isClosed: false,
+      desiredSize: 1,
+      decodeQueueSize: 0,
+      dequeued: Promise.resolve(),
+      async decode() {
+        throw new Error("row worker crashed");
+      },
+      async close() {
+        decoder.isClosed = true;
+      }
+    };
+    broken.push(decoder);
+    return decoder;
+  });
+  module.registerDnxDecoder({ useSharedMemory: false, idleCloseMs: 60_000 });
+  const before = module.sharedDecoderPoolStats().discarded;
+  const failInput = new module.Input({
+    formats: [new module.QuickTimeInputFormat()],
+    source: new module.BufferSource(bytes)
+  });
+  try {
+    const track = await failInput.getPrimaryVideoTrack();
+    const sink = new module.VideoSampleSink(track);
+    await assert.rejects(sink.getSample(0), /row worker crashed/);
+    for (let i = 0; i < 50 && module.sharedDecoderPoolStats().discarded === before; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(module.sharedDecoderPoolStats().discarded, before + 1);
+    assert.equal(broken[0].isClosed, true);
+    assert.equal(module.sharedDecoderPoolStats().idle, 0);
+  } finally {
+    failInput.dispose();
+    module.setSharedDecoderFactoryForTests(null);
+    module.registerDnxDecoder({});
+  }
 }
 
 console.log("Mediabunny compatibility preflight and DNx decode passed.");
@@ -82,7 +126,7 @@ async function loadModule() {
     stdin: {
       contents: `
         export { registerDnxDecoder } from ${entry};
-        export { sharedDecoderPoolStats } from ${JSON.stringify(path.join(repoRoot, "src/dnxSharedDecoderPool.ts"))};
+        export { sharedDecoderPoolStats, setSharedDecoderFactoryForTests } from ${JSON.stringify(path.join(repoRoot, "src/dnxSharedDecoderPool.ts"))};
         export { BufferSource, Input, InputVideoTrack, QuickTimeInputFormat, VideoSampleSink } from "mediabunny";
       `,
       resolveDir: repoRoot,

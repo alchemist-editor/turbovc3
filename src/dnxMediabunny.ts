@@ -261,6 +261,7 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
 
   private async decodeSample(packet: EncodedPacket): Promise<VideoSample> {
     const decoder = this.requireDecoder();
+    const lease = this.lease;
     const frame = this.framePool.pop() ?? new Frame();
     try {
       const decoded = await decoder.decode(packet.data, frame);
@@ -268,6 +269,11 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
         throw decoded;
       }
       return createVideoSample(decoded, packet, this.config);
+    } catch (error) {
+      // A rejected decode (a crashed or failed worker surfaces here too) may
+      // leave the decoder broken: never hand it to the next Mediabunny decoder.
+      lease?.markFailed();
+      throw error;
     } finally {
       this.framePool.push(frame);
     }
