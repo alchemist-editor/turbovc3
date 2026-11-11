@@ -15,6 +15,8 @@ import {
   type VideoCodec
 } from "mediabunny";
 import { Decoder, Frame, type FilledFrame } from "./dnxDecoder.js";
+import { acquireSharedDecoder, type SharedDecoderLease } from "./dnxSharedDecoderPool.js";
+import type { DnxWasmUrls, DnxWorkerStartError, DnxWorkerUrls } from "./dnxWorker.js";
 import {
   DNX_SAMPLE_ENTRIES,
   parseDnxFrameHeader,
@@ -145,8 +147,33 @@ function normalizeInternalCodecId(codecId: string | number | Uint8Array | null):
 const DNX_TRACK_SHIM = Symbol.for("@wasm-codecs/dnx Mediabunny track shim");
 const trackDecodability = new WeakMap<InputVideoTrack, Promise<boolean>>();
 
+/** Options for {@link registerDnxDecoder}; every field is optional. */
+export interface RegisterDnxDecoderOptions {
+  /**
+   * Decoder backend: `true` for shared-memory row workers (one frame split
+   * across workers; needs cross-origin isolation), `false` for packet workers
+   * (a frame per worker). Default: row workers when `Decoder.canUseSharedMemory()`.
+   */
+  useSharedMemory?: boolean;
+  /** Where the WebAssembly modules are fetched from. */
+  wasmUrls?: DnxWasmUrls;
+  /** Worker module URLs, for bundlers that emit the workers elsewhere. */
+  workerUrls?: DnxWorkerUrls;
+  /** Called when a worker backend fails to start (the decoder still falls back). */
+  onWorkerStartError?: (error: DnxWorkerStartError) => void;
+  /**
+   * How long the shared decoder stays open after Mediabunny's last decoder
+   * closes, in ms (default 1000). Mediabunny builds a decoder per
+   * `getSample()` call, so this keeps one worker pool across a run of seeks.
+   */
+  idleCloseMs?: number;
+}
+
+let registeredOptions: RegisterDnxDecoderOptions = {};
+
 class MediabunnyDnxDecoder extends CustomVideoDecoder {
   private decoder: Decoder | null = null;
+  private lease: SharedDecoderLease | null = null;
   private readonly framePool: Frame[] = [];
   private emissionTail: Promise<void> = Promise.resolve();
 
@@ -166,15 +193,22 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
       throw new Error(`Unsupported DNx decoder configuration codec "${this.config.codec}".`);
     }
 
-    const decoder = await Decoder.create({
+    const options = registeredOptions;
+    // One worker pool for every Mediabunny decoder of this configuration.
+    const lease = await acquireSharedDecoder({
       dnxFourCc,
-      useSharedMemory: Decoder.canUseSharedMemory(),
-      allowedOutputFormats: ["yuv422p8", "yuv422p10", "yuv422p12", "yuv444p10", "yuv444p12"]
+      useSharedMemory: options.useSharedMemory ?? Decoder.canUseSharedMemory(),
+      allowedOutputFormats: ["yuv422p8", "yuv422p10", "yuv422p12", "yuv444p10", "yuv444p12"],
+      wasmUrls: options.wasmUrls,
+      workerUrls: options.workerUrls,
+      onWorkerStartError: options.onWorkerStartError,
+      idleCloseMs: options.idleCloseMs
     });
-    if (decoder instanceof Error) {
-      throw decoder;
+    if (lease instanceof Error) {
+      throw lease;
     }
-    this.decoder = decoder;
+    this.lease = lease;
+    this.decoder = lease.decoder;
   }
 
   async decode(packet: EncodedPacket): Promise<void> {
@@ -203,10 +237,10 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
   }
 
   async flush(): Promise<void> {
-    const decoder = this.requireDecoder();
-    while (decoder.decodeQueueSize > 0) {
-      await decoder.dequeued;
-    }
+    this.requireDecoder();
+    // Every decode this instance queued settles through emissionTail. The
+    // decoder's own queue is shared with other Mediabunny decoders, so it is
+    // not waited on here.
     await this.emissionTail;
   }
 
@@ -217,7 +251,9 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     }
 
     await this.flush();
-    await decoder.close();
+    // The shared decoder closes once no Mediabunny decoder holds it.
+    this.lease?.release();
+    this.lease = null;
     this.decoder = null;
     for (const frame of this.framePool) {
       frame.clear();
@@ -521,8 +557,16 @@ function assertMediabunnyCompatibility(): void {
 
 /**
  * Registers the DNxHD/DNxHR decoder for automatic use by Mediabunny. Call this before starting a decoding task.
+ *
+ * `options` choose the backend, the WebAssembly and worker URLs, a hook for
+ * worker start failures and how long the shared decoder idles. A later call
+ * replaces them for decoders created from then on; with no options the
+ * defaults apply, as before.
  */
-export function registerDnxDecoder(): void {
+export function registerDnxDecoder(options?: RegisterDnxDecoderOptions): void {
+  if (options) {
+    registeredOptions = { ...options };
+  }
   if (registered) {
     return;
   }

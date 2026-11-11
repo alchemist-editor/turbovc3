@@ -33,6 +33,29 @@ host rewrites module URLs, verify these four package resources in the deployed o
 Missing native assets fall back to TypeScript. Missing worker assets fall back to a synchronous backend. Treat those
 fallbacks as resilience, not as a deployment check; exercise the backend diagnostics in a production-like build.
 
+When the bundler emits these files elsewhere, pass their URLs instead of rewriting the package: `Decoder.create` takes
+`wasmUrls` (`rowDecoder`, `idctKernel`) and `workerUrls` (`sharedRow`, `packet`), and `registerDnxDecoder` takes the
+same options for Mediabunny decoding. Relative URLs resolve against the page; workers receive absolute URLs. Pass
+`onWorkerStartError` to learn why a worker backend did not start; the decoder still falls back.
+
+```ts
+registerDnxDecoder({
+  useSharedMemory: false, // packet workers; default: row workers when cross-origin isolated
+  wasmUrls: { rowDecoder: rowWasmUrl, idctKernel: idctWasmUrl },
+  workerUrls: { sharedRow: sharedRowWorkerUrl, packet: packetWorkerUrl },
+  onWorkerStartError: ({ backend, error }) => console.warn(`DNx ${backend} workers did not start`, error)
+});
+```
+
+## Shared decoders
+
+Mediabunny builds a new custom decoder for each `VideoSampleSink.getSample()` call and each `samples()` session.
+`registerDnxDecoder` gives every Mediabunny DNx decoder of the same configuration one reference-counted `Decoder`, so
+they share one worker pool. When the last one closes, the shared decoder stays open for `idleCloseMs` (default 1000 ms)
+so a run of seeks reuses it, then closes and terminates its workers. `acquireSharedDecoder` exposes the same pool to
+callers that manage decoders themselves; `sharedDecoderPoolStats` and `closeSharedDecoders` support diagnostics and
+teardown.
+
 ## Vite
 
 Vite's native `new URL(..., import.meta.url)` and module-worker handling work without a plugin. Import the package

@@ -6,6 +6,13 @@ All notable changes to turbovc3 will be documented here.
 
 ### Added
 
+- `registerDnxDecoder(options)`: the backend (`useSharedMemory`), the WebAssembly and worker URLs, an
+  `onWorkerStartError` hook for worker backends that fail to start, and the shared decoder's idle time. With no options
+  it behaves as before.
+- Mediabunny DNx decoders of one configuration share one reference-counted `Decoder` and worker pool
+  (`acquireSharedDecoder`), kept open briefly after the last one closes, instead of a new pool per `getSample()` call.
+- `Decoder.create` options `wasmUrls`, `workerUrls` and `onWorkerStartError`.
+
 - A maintained local browser example covering MXF file open, decode, Canvas2D playback, PCM audio clocking, seeking,
   and backend/cache/I/O diagnostics.
 - A release-generated JSON compatibility report containing the packed file inventory, public API hashes, dependency
