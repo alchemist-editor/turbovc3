@@ -18,6 +18,8 @@ interface WorkerSlot {
 
 interface PendingRow {
   row: number;
+  /** The worker decoding the row: only its failure may settle the row early. */
+  slot: WorkerSlot;
   resolve(): void;
   reject(error: Error): void;
 }
@@ -173,7 +175,7 @@ export class DnxSharedRowDecoder {
       const slot = availableSlots[index % availableSlots.length];
       const requestId = this.nextRequestId++;
       return new Promise<void>((resolve, reject) => {
-        this.pendingRows.set(requestId, { row: row.row, resolve, reject });
+        this.pendingRows.set(requestId, { row: row.row, slot, resolve, reject });
         const request: DnxSharedRowWorkerRequest = {
           type: "decode-row",
           requestId,
@@ -258,10 +260,15 @@ export class DnxSharedRowDecoder {
     }
     slot.failed = true;
     slot.worker.terminate();
-    for (const pending of this.pendingRows.values()) {
-      pending.reject(error);
+    // A terminated worker never answers, so its rows fail now. Rows on the
+    // other workers are still running: they settle on their own answers, so a
+    // failed frame never finishes while its rows still write.
+    for (const [requestId, pending] of this.pendingRows) {
+      if (pending.slot === slot) {
+        this.pendingRows.delete(requestId);
+        pending.reject(error);
+      }
     }
-    this.pendingRows.clear();
   }
 
   private signalDequeued(): void {
