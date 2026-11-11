@@ -26,10 +26,14 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# ReleaseFast decodes about a quarter faster than ReleaseSmall in Chromium
+# (docs/benchmarks.md). -fstrip drops the debug sections ReleaseFast otherwise
+# keeps: about 29 KB with it, 834 KB without.
 "$ZIG_BIN" build-exe "$SRC" \
   -target wasm32-freestanding \
   -mcpu=generic+simd128 \
-  -O ReleaseSmall \
+  -O ReleaseFast \
+  -fstrip \
   -fno-entry \
   -rdynamic \
   --export-memory \

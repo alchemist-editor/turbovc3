@@ -28,6 +28,7 @@ mkdir -p "$EM_CACHE"
 
 emcc "$SRC" \
   -O3 \
+  -msimd128 \
   -s STANDALONE_WASM=1 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s EXPORTED_FUNCTIONS='["_dnx_idct_i32_blocks","_dnx_idct_kernel_version","_malloc","_free"]' \
