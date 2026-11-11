@@ -98,6 +98,9 @@ All notable changes to turbovc3 will be documented here.
   shared-row worker has failed. The shared decoder pool closes such a decoder instead of handing it out from idle
   (counted in `sharedDecoderPoolStats().discarded`), and a Mediabunny decode waiting for capacity on one now rejects
   and gives the decoder back instead of waiting forever.
+- A `wasmUrls` override no longer throws when the library runs from a `blob:` or `data:` module: the default
+  `../wasm/generated/` URL is built from `import.meta.url` only when there is no override, and an override resolves on
+  its own (absolute as given, relative against the page).
 
 ### Changed
 

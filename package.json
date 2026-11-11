@@ -65,7 +65,7 @@
     "fixtures:fetch-extended": "node scripts/fetch-extended-fixtures.mjs",
     "fixtures:verify": "node tests/committed-fixtures-test.mjs",
     "test": "npm run test:unit && npm run test:fixtures",
-    "test:unit": "node tests/dnx-pixel-conversion-test.mjs && node tests/dnx-edge-layout-test.mjs && node tests/dnx-canvas-renderer-test.mjs && node tests/dnx-webgpu-renderer-test.mjs && node tests/dnx-decoder-contract-test.mjs && node tests/dnx-playback-clock-test.mjs && node tests/dnx-audio-playback-test.mjs && node tests/dnx-malformed-test.mjs && node tests/mxf-demuxer-test.mjs && node tests/mediabunny-compat-test.mjs && node tests/shared-decoder-pool-test.mjs && node tests/fuzz-smoke-test.mjs",
+    "test:unit": "node tests/dnx-pixel-conversion-test.mjs && node tests/dnx-edge-layout-test.mjs && node tests/dnx-canvas-renderer-test.mjs && node tests/dnx-webgpu-renderer-test.mjs && node tests/dnx-decoder-contract-test.mjs && node tests/dnx-playback-clock-test.mjs && node tests/dnx-audio-playback-test.mjs && node tests/dnx-malformed-test.mjs && node tests/mxf-demuxer-test.mjs && node tests/mediabunny-compat-test.mjs && node tests/shared-decoder-pool-test.mjs && node tests/wasm-url-override-test.mjs && node tests/fuzz-smoke-test.mjs",
     "test:fuzz": "node tests/fuzz-smoke-test.mjs --iterations 256",
     "test:fixtures": "node tests/committed-fixtures-test.mjs",
     "test:extended": "node tests/dnx-oracle-test.mjs --allow-missing",

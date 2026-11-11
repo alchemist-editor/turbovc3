@@ -152,9 +152,13 @@ class DnxWasmIdctKernel implements DnxIdctKernel {
 }
 
 async function loadCompiledModule(wasmUrl?: string | URL): Promise<WebAssembly.Module> {
-  // Resolved on use, not at import: a bundle without a URL base must still load.
-  const defaultUrl = new URL("../wasm/generated/dnx_idct_kernel.wasm", import.meta.url);
-  const url = wasmUrl === undefined ? defaultUrl : new URL(wasmUrl, defaultUrl);
+  // The default is resolved only when used, and never for an override: in a
+  // blob: or data: module import.meta.url cannot be a base, so building the
+  // default URL there throws. An override is absolute as given, or relative
+  // to the page (or the calling worker).
+  const url = wasmUrl === undefined
+    ? new URL("../wasm/generated/dnx_idct_kernel.wasm", import.meta.url)
+    : new URL(wasmUrl, (globalThis as { location?: { href?: string } }).location?.href ?? import.meta.url);
   let compiled = compiledModules.get(url.href);
   if (!compiled) {
     compiled = fetch(url).then(async (response) => {
