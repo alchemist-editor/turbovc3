@@ -1,148 +1,175 @@
 import { Decoder, type DecoderOptions, type DnxNotSupportedError } from "./dnxDecoder.js";
 
 /**
- * Reference-counted {@link Decoder}s shared by every caller that asks for the
+ * A pool of turbovc3 {@link Decoder}s reused across callers that ask for the
  * same configuration. Mediabunny builds a new custom decoder for each
  * `VideoSampleSink.getSample()` call (and each `samples()` session), and a
  * turbovc3 `Decoder` owns a worker pool and its WebAssembly instances, so
- * without sharing every paused seek started and tore down a pool of workers.
+ * without reuse every paused seek started and tore down a pool of workers.
  *
- * Leases of the same configuration share one `Decoder` (its worker pool
- * serves their decodes concurrently). When the last lease is released the
- * decoder is closed after `idleCloseMs`, so a run of seeks keeps one pool
- * warm; a lease taken in that window cancels the close.
+ * Each lease holds a decoder of its own: concurrent players never share one,
+ * because a shared-memory row decoder decodes one frame at a time and eight
+ * layers through one of them fall far below real time. A released decoder
+ * waits idle for the next lease of the same configuration and closes after
+ * `idleCloseMs`; at most `maxIdleDecoders` wait per configuration.
  */
 
 export interface SharedDecoderOptions extends DecoderOptions {
-  /** How long an unused decoder stays open for the next lease, in ms (default 1000; 0 closes at once). */
+  /** How long a released decoder waits for the next lease, in ms (default 1000; 0 closes at once). */
   idleCloseMs?: number;
+  /** Released decoders kept waiting per configuration (default 4); more are closed at once. */
+  maxIdleDecoders?: number;
 }
 
 export interface SharedDecoderLease {
   readonly decoder: Decoder;
-  /** Give the decoder back. Idempotent; the decoder closes once no lease holds it. */
+  /** Give the decoder back. Idempotent; it waits for the next lease or closes. */
   release(): void;
 }
 
-/** Live shared decoders, for diagnostics and tests. */
+/** Live pooled decoders, for diagnostics and tests. */
 export interface SharedDecoderPoolStats {
-  /** Decoders created and not yet closed (including ones still starting). */
+  /** Decoders open: leased, idle, or still starting. */
   decoders: number;
   /** Leases currently held. */
   leases: number;
+  /** Released decoders waiting for the next lease. */
+  idle: number;
 }
 
 export const DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS = 1000;
+export const DEFAULT_SHARED_DECODER_MAX_IDLE = 4;
 
 type DecoderCreate = (options: DecoderOptions) => Promise<Decoder | DnxNotSupportedError>;
 
-interface Entry {
-  key: string;
-  created: Promise<Decoder | DnxNotSupportedError>;
-  leases: number;
-  closeTimer: ReturnType<typeof setTimeout> | null;
+interface IdleDecoder {
+  decoder: Decoder;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
-const entries = new Map<string, Entry>();
+interface Bucket {
+  idle: IdleDecoder[];
+  leased: number;
+  starting: number;
+}
+
+const buckets = new Map<string, Bucket>();
 let createDecoder: DecoderCreate = (options) => Decoder.create(options);
 
 /**
- * A lease on the shared decoder for `options`, creating it if needed. Returns
- * the decoder's creation error (and caches nothing) when it cannot be built.
+ * A lease on a decoder for `options`: an idle one of the same configuration if
+ * there is one, otherwise a new one. Returns the creation error when a decoder
+ * cannot be built.
  */
 export async function acquireSharedDecoder(
   options: SharedDecoderOptions
 ): Promise<SharedDecoderLease | DnxNotSupportedError> {
   const key = keyFor(options);
-  let entry = entries.get(key);
-  if (!entry) {
-    const { idleCloseMs: _idle, ...decoderOptions } = options;
-    entry = { key, created: createDecoder(decoderOptions), leases: 0, closeTimer: null };
-    entries.set(key, entry);
+  const bucket = bucketFor(key);
+  let decoder: Decoder | null = null;
+  while (bucket.idle.length > 0 && !decoder) {
+    const idle = bucket.idle.pop() as IdleDecoder;
+    if (idle.timer !== null) {
+      clearTimeout(idle.timer);
+    }
+    if (!idle.decoder.isClosed) {
+      decoder = idle.decoder;
+    }
   }
-  entry.leases += 1;
-  if (entry.closeTimer !== null) {
-    clearTimeout(entry.closeTimer);
-    entry.closeTimer = null;
-  }
-  const current = entry;
-  const created = await current.created;
-  if (created instanceof Error || created.isClosed) {
-    current.leases -= 1;
-    if (entries.get(key) === current) {
-      entries.delete(key);
+  if (!decoder) {
+    const { idleCloseMs: _idle, maxIdleDecoders: _max, ...decoderOptions } = options;
+    bucket.starting += 1;
+    let created: Decoder | DnxNotSupportedError;
+    try {
+      created = await createDecoder(decoderOptions);
+    } finally {
+      bucket.starting -= 1;
     }
     if (created instanceof Error) {
+      dropIfEmpty(key, bucket);
       return created;
     }
-    // Closed under us (for example by closeSharedDecoders): start over.
-    return acquireSharedDecoder(options);
+    decoder = created;
   }
+  bucket.leased += 1;
+  const leased = decoder;
   let released = false;
   return {
-    decoder: created,
+    decoder: leased,
     release: () => {
       if (released) {
         return;
       }
       released = true;
-      releaseEntry(current, options.idleCloseMs ?? DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS);
+      bucket.leased -= 1;
+      park(key, bucket, leased, options);
     }
   };
 }
 
-function releaseEntry(entry: Entry, idleCloseMs: number): void {
-  entry.leases -= 1;
-  if (entry.leases > 0) {
+function park(key: string, bucket: Bucket, decoder: Decoder, options: SharedDecoderOptions): void {
+  const idleCloseMs = options.idleCloseMs ?? DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS;
+  const maxIdle = options.maxIdleDecoders ?? DEFAULT_SHARED_DECODER_MAX_IDLE;
+  if (decoder.isClosed || idleCloseMs <= 0 || bucket.idle.length >= maxIdle || buckets.get(key) !== bucket) {
+    void decoder.close();
+    dropIfEmpty(key, bucket);
     return;
   }
-  if (idleCloseMs <= 0) {
-    void closeEntry(entry);
-    return;
-  }
-  entry.closeTimer = setTimeout(() => {
-    entry.closeTimer = null;
-    if (entry.leases === 0) {
-      void closeEntry(entry);
+  const idle: IdleDecoder = { decoder, timer: null };
+  idle.timer = setTimeout(() => {
+    idle.timer = null;
+    const index = bucket.idle.indexOf(idle);
+    if (index >= 0) {
+      bucket.idle.splice(index, 1);
+      void decoder.close();
+      dropIfEmpty(key, bucket);
     }
   }, idleCloseMs);
   // Never keep a Node process alive for an idle decoder.
-  (entry.closeTimer as { unref?: () => void }).unref?.();
+  (idle.timer as { unref?: () => void }).unref?.();
+  bucket.idle.push(idle);
 }
 
-async function closeEntry(entry: Entry): Promise<void> {
-  if (entries.get(entry.key) === entry) {
-    entries.delete(entry.key);
+function bucketFor(key: string): Bucket {
+  let bucket = buckets.get(key);
+  if (!bucket) {
+    bucket = { idle: [], leased: 0, starting: 0 };
+    buckets.set(key, bucket);
   }
-  const created = await entry.created;
-  if (!(created instanceof Error)) {
-    await created.close();
+  return bucket;
+}
+
+function dropIfEmpty(key: string, bucket: Bucket): void {
+  if (bucket.idle.length === 0 && bucket.leased === 0 && bucket.starting === 0 && buckets.get(key) === bucket) {
+    buckets.delete(key);
   }
 }
 
-/** Close every shared decoder now, leased or not (page teardown, tests). */
+/** Close every idle decoder now (page teardown, tests). Leased decoders close when released. */
 export async function closeSharedDecoders(): Promise<void> {
-  const all = [...entries.values()];
-  entries.clear();
-  await Promise.all(
-    all.map(async (entry) => {
-      if (entry.closeTimer !== null) {
-        clearTimeout(entry.closeTimer);
+  const closing: Promise<void>[] = [];
+  for (const [key, bucket] of [...buckets]) {
+    for (const idle of bucket.idle.splice(0)) {
+      if (idle.timer !== null) {
+        clearTimeout(idle.timer);
       }
-      const created = await entry.created;
-      if (!(created instanceof Error)) {
-        await created.close();
-      }
-    })
-  );
+      closing.push(idle.decoder.close());
+    }
+    dropIfEmpty(key, bucket);
+  }
+  await Promise.all(closing);
 }
 
 export function sharedDecoderPoolStats(): SharedDecoderPoolStats {
   let leases = 0;
-  for (const entry of entries.values()) {
-    leases += entry.leases;
+  let idle = 0;
+  let starting = 0;
+  for (const bucket of buckets.values()) {
+    leases += bucket.leased;
+    idle += bucket.idle.length;
+    starting += bucket.starting;
   }
-  return { decoders: entries.size, leases };
+  return { decoders: leases + idle + starting, leases, idle };
 }
 
 /** Tests only: build decoders with `create` instead of `Decoder.create`. */

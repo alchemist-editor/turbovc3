@@ -51,7 +51,7 @@ try {
 }
 
 // Options: a later call replaces them. Every getSample() builds a Mediabunny
-// decoder; they share one turbovc3 decoder, which closes when they are done.
+// decoder; they reuse one turbovc3 decoder, which closes when they are done.
 module.registerDnxDecoder({ useSharedMemory: false, idleCloseMs: 0 });
 const seekInput = new module.Input({
   formats: [new module.QuickTimeInputFormat()],
@@ -69,7 +69,7 @@ try {
   for (let i = 0; i < 50 && module.sharedDecoderPoolStats().decoders > 0; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.deepEqual(module.sharedDecoderPoolStats(), { decoders: 0, leases: 0 });
+  assert.deepEqual(module.sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
 } finally {
   seekInput.dispose();
 }

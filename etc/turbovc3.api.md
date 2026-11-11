@@ -139,6 +139,9 @@ export interface DecoderOptions {
 // @public (undocumented)
 export const DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS = 1000;
 
+// @public (undocumented)
+export const DEFAULT_SHARED_DECODER_MAX_IDLE = 4;
+
 // @public
 export function deinterlaceDnxFrameLayout(source: DnxFrameLayout, parity: DnxFieldParity): DnxFrameLayout;
 
@@ -1303,11 +1306,13 @@ export interface SharedDecoderLease {
 // @public
 export interface SharedDecoderOptions extends DecoderOptions {
     idleCloseMs?: number;
+    maxIdleDecoders?: number;
 }
 
 // @public
 export interface SharedDecoderPoolStats {
     decoders: number;
+    idle: number;
     leases: number;
 }
 

@@ -162,9 +162,9 @@ export interface RegisterDnxDecoderOptions {
   /** Called when a worker backend fails to start (the decoder still falls back). */
   onWorkerStartError?: (error: DnxWorkerStartError) => void;
   /**
-   * How long the shared decoder stays open after Mediabunny's last decoder
-   * closes, in ms (default 1000). Mediabunny builds a decoder per
-   * `getSample()` call, so this keeps one worker pool across a run of seeks.
+   * How long a released decoder waits for the next Mediabunny decoder, in ms
+   * (default 1000). Mediabunny builds a decoder per `getSample()` call, so
+   * this keeps one worker pool across a run of seeks.
    */
   idleCloseMs?: number;
 }
@@ -194,7 +194,7 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     }
 
     const options = registeredOptions;
-    // One worker pool for every Mediabunny decoder of this configuration.
+    // A pooled decoder: reused across getSample() calls, never shared by two at once.
     const lease = await acquireSharedDecoder({
       dnxFourCc,
       useSharedMemory: options.useSharedMemory ?? Decoder.canUseSharedMemory(),
@@ -238,9 +238,7 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
 
   async flush(): Promise<void> {
     this.requireDecoder();
-    // Every decode this instance queued settles through emissionTail. The
-    // decoder's own queue is shared with other Mediabunny decoders, so it is
-    // not waited on here.
+    // Every decode this instance queued settles through emissionTail.
     await this.emissionTail;
   }
 
@@ -251,7 +249,7 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     }
 
     await this.flush();
-    // The shared decoder closes once no Mediabunny decoder holds it.
+    // Back to the pool: the next Mediabunny decoder reuses it, or it closes.
     this.lease?.release();
     this.lease = null;
     this.decoder = null;
@@ -559,7 +557,7 @@ function assertMediabunnyCompatibility(): void {
  * Registers the DNxHD/DNxHR decoder for automatic use by Mediabunny. Call this before starting a decoding task.
  *
  * `options` choose the backend, the WebAssembly and worker URLs, a hook for
- * worker start failures and how long the shared decoder idles. A later call
+ * worker start failures and how long a released decoder idles. A later call
  * replaces them for decoders created from then on; with no options the
  * defaults apply, as before.
  */
