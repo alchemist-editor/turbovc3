@@ -167,6 +167,24 @@ run_ffmpeg -v error -y \
   -metadata creation_time=1970-01-01T00:00:00Z -f mxf_opatom \
   "$OUTPUT_DIR/dnxhr-lb-opatom.mxf"
 
+# 2160p DNxHR (issue #23): padded to a fixed frame size, so the last row's span
+# exceeds the 1 MiB Zig row buffer. 4320p: over every Zig limit. Stored
+# gzipped; the padding compresses to almost nothing.
+for fixture in \
+  "dnxhr_hqx_2160p30_testsrc testsrc 3840x2160 yuv422p10le dnxhr_hqx" \
+  "dnxhr_hq_2160p30_testsrc testsrc 3840x2160 yuv422p dnxhr_hq" \
+  "dnxhr_444_2160p30_testsrc testsrc 3840x2160 yuv444p10le dnxhr_444" \
+  "dnxhr_hqx_4320p30_smptehdbars smptehdbars 7680x4320 yuv422p10le dnxhr_hqx"
+do
+  read -r name source size format profile <<< "$fixture"
+  run_ffmpeg -v error -y \
+    -f lavfi -i "$source=size=$size:rate=30:duration=1" \
+    -frames:v 1 -pix_fmt "$format" -c:v dnxhd -profile:v "$profile" -an \
+    -metadata creation_time=1970-01-01T00:00:00Z \
+    "$OUTPUT_DIR/$name.mov"
+  gzip -n -9 -f "$OUTPUT_DIR/$name.mov"
+done
+
 for fixture in \
   "oracle_dnxhd_1080i2997_10bit_cid1241.mxf yuv422p10le" \
   "oracle_dnxhd_1080i2997_8bit_cid1242.mxf yuv422p" \
