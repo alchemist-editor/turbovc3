@@ -10,6 +10,7 @@ export {
   acquireSharedDecoder,
   closeSharedDecoders,
   DEFAULT_SHARED_DECODER_IDLE_CLOSE_MS,
+  DEFAULT_SHARED_DECODER_MAX_IDLE,
   sharedDecoderPoolStats,
   type SharedDecoderLease,
   type SharedDecoderOptions,

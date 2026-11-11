@@ -47,14 +47,15 @@ registerDnxDecoder({
 });
 ```
 
-## Shared decoders
+## Reused decoders
 
 Mediabunny builds a new custom decoder for each `VideoSampleSink.getSample()` call and each `samples()` session.
-`registerDnxDecoder` gives every Mediabunny DNx decoder of the same configuration one reference-counted `Decoder`, so
-they share one worker pool. When the last one closes, the shared decoder stays open for `idleCloseMs` (default 1000 ms)
-so a run of seeks reuses it, then closes and terminates its workers. `acquireSharedDecoder` exposes the same pool to
-callers that manage decoders themselves; `sharedDecoderPoolStats` and `closeSharedDecoders` support diagnostics and
-teardown.
+`registerDnxDecoder` hands each Mediabunny DNx decoder a turbovc3 `Decoder` from a pool: a released decoder waits
+`idleCloseMs` (default 1000 ms) for the next one of the same configuration, so a run of seeks reuses one worker pool,
+then closes and terminates its workers. At most `maxIdleDecoders` (default 4) wait per configuration. Decoders in use
+at the same time are never shared: a shared-memory row decoder decodes one frame at a time, so several players on one
+would fall below real time. `acquireSharedDecoder` exposes the same pool to callers that manage decoders themselves;
+`sharedDecoderPoolStats` and `closeSharedDecoders` support diagnostics and teardown.
 
 ## Vite
 

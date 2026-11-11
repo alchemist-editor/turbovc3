@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The shared, reference-counted decoder pool behind registerDnxDecoder
+// The reused-decoder pool behind registerDnxDecoder
 // (src/dnxSharedDecoderPool.ts), with fake workers so worker lifetimes are visible.
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -57,18 +57,35 @@ async function run(name, fn) {
   }
 }
 
-await run("N decoders of one configuration share one decoder and one worker pool", async () => {
+await run("N decoders one after another reuse one decoder and one worker pool", async () => {
+  const workers = fakeWorkers();
+  const options = { ...base, workerFactory: workers.factory, idleCloseMs: 1000 };
+  const decoders = new Set();
+  // Mediabunny's getSample: build a decoder, decode, close; five times.
+  for (let i = 0; i < 5; i += 1) {
+    const lease = await acquireSharedDecoder(options);
+    assert.ok(!(lease instanceof Error));
+    decoders.add(lease.decoder);
+    lease.release();
+  }
+  assert.equal(decoders.size, 1);
+  assert.equal(workers.created(), 2, "one pool of two packet workers");
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 1, leases: 0, idle: 1 });
+  await closeSharedDecoders();
+  assert.equal(workers.live.size, 0);
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
+});
+
+await run("concurrent decoders never share one (each player keeps its throughput)", async () => {
   const workers = fakeWorkers();
   const options = { ...base, workerFactory: workers.factory, idleCloseMs: 0 };
-  const leases = await Promise.all(Array.from({ length: 5 }, () => acquireSharedDecoder(options)));
-  assert.ok(leases.every((lease) => !(lease instanceof Error)));
-  assert.equal(new Set(leases.map((lease) => lease.decoder)).size, 1);
-  assert.equal(workers.created(), 2, "one pool of two packet workers");
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 1, leases: 5 });
+  const leases = await Promise.all(Array.from({ length: 4 }, () => acquireSharedDecoder(options)));
+  assert.equal(new Set(leases.map((lease) => lease.decoder)).size, 4);
+  assert.equal(workers.created(), 8);
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 4, leases: 4, idle: 0 });
   for (const lease of leases) lease.release();
   await sleep(0);
   assert.equal(workers.live.size, 0);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0 });
 });
 
 await run("close order does not leak workers, and releases are idempotent", async () => {
@@ -77,16 +94,31 @@ await run("close order does not leak workers, and releases are idempotent", asyn
     const options = { ...base, workerFactory: workers.factory, idleCloseMs: 0 };
     const leases = [];
     for (let i = 0; i < 3; i += 1) leases.push(await acquireSharedDecoder(options));
-    for (const index of order) {
+    for (const [step, index] of order.entries()) {
       leases[index].release();
       leases[index].release();
       await sleep(0);
-      const remaining = leases.length - order.indexOf(index) - 1;
-      assert.equal(workers.live.size, remaining > 0 ? 2 : 0, `order ${order} after ${index}`);
-      assert.equal(leases[0].decoder.isClosed, remaining === 0);
+      assert.equal(leases[index].decoder.isClosed, true);
+      assert.equal(workers.live.size, 2 * (leases.length - step - 1), `order ${order} after ${index}`);
     }
-    assert.equal(workers.created(), 2);
+    assert.equal(workers.created(), 6);
   }
+});
+
+await run("at most maxIdleDecoders wait per configuration; the rest close at once", async () => {
+  const workers = fakeWorkers();
+  const options = { ...base, workerFactory: workers.factory, idleCloseMs: 1000, maxIdleDecoders: 2 };
+  const leases = await Promise.all(Array.from({ length: 5 }, () => acquireSharedDecoder(options)));
+  for (const lease of leases) lease.release();
+  await sleep(0);
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 2, leases: 0, idle: 2 });
+  assert.equal(workers.live.size, 4);
+  // The next two leases take the idle decoders; the third builds a new one.
+  const again = [await acquireSharedDecoder(options), await acquireSharedDecoder(options)];
+  assert.equal(workers.created(), 10);
+  const third = await acquireSharedDecoder(options);
+  assert.equal(workers.created(), 12);
+  for (const lease of [...again, third]) lease.release();
 });
 
 await run("an idle decoder stays warm for the next lease, then closes", async () => {
@@ -103,6 +135,7 @@ await run("an idle decoder stays warm for the next lease, then closes", async ()
   await sleep(80);
   assert.equal(workers.live.size, 0);
   assert.equal(first.decoder.isClosed, true);
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
   // After the close, a new lease builds a new pool.
   const third = await acquireSharedDecoder(options);
   assert.notEqual(third.decoder, first.decoder);
@@ -120,7 +153,7 @@ await run("different configurations get different decoders", async () => {
     idleCloseMs: 0
   });
   assert.notEqual(a.decoder, b.decoder);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 2, leases: 2 });
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 2, leases: 2, idle: 0 });
   a.release();
   b.release();
   await sleep(0);
@@ -138,7 +171,7 @@ await run("a creation error is returned and not cached", async () => {
   const second = await acquireSharedDecoder({ ...base, idleCloseMs: 0 });
   assert.ok(second instanceof Error);
   assert.equal(calls, 2);
-  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0 });
+  assert.deepEqual(sharedDecoderPoolStats(), { decoders: 0, leases: 0, idle: 0 });
 });
 
 await run("worker and wasm URL options reach the workers as absolute URLs", async () => {

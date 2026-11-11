@@ -117,7 +117,7 @@ test("worker start failures are reported and the decoder falls back", async ({ p
   expect(result.mode).toBe("zig-wasm-frame");
 });
 
-test("Mediabunny decoders share one worker pool across getSample calls", async ({ page }) => {
+test("Mediabunny decoders reuse one worker pool across getSample calls", async ({ page }) => {
   // dist imports the bare "mediabunny" specifier: map it for this page.
   await page.route("**/", async (route) => {
     const response = await route.fetch();
@@ -155,7 +155,7 @@ test("Mediabunny decoders share one worker pool across getSample calls", async (
     input.dispose();
     return { decoders, concurrency: Math.min(4, Math.max(1, navigator.hardwareConcurrency ?? 4)) };
   });
-  // Four getSample calls, four Mediabunny decoders, one shared turbovc3 decoder.
+  // Four getSample calls, four Mediabunny decoders, one reused turbovc3 decoder.
   expect(Math.max(...result.decoders)).toBe(1);
   // One pool's workers, not one pool per call (Cache-Control: no-store, so each start is a request).
   expect(workersStarted.length).toBe(result.concurrency);
