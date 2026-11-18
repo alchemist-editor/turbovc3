@@ -139,6 +139,9 @@ const Job = struct {
             .chroma_width = 0,
             .plane_height = 0,
         };
+        // The coded rows must cover the picture: storage is allocated for
+        // the visible size, and only coded rows are ever written.
+        if (hdr.macroblock_height == 0 or @as(u32, hdr.macroblock_height) * 16 < hdr.height) return error.InvalidDnxHeader;
         if (hdr.macroblock_height > job.spans.len) return error.TooManyRows;
         const spans = header_mod.parseRowSpans(packet, hdr, &job.spans) catch return error.DnxDecodeFailed;
         job.span_count = spans.len;
@@ -606,5 +609,18 @@ test "a corrupt packet fails cleanly on every thread count" {
     @memset(packet[header.data_offset + 16 ..], 0xff);
     for ([_]u32{ 1, 4 }) |threads| {
         try testing.expectError(error.DnxDecodeFailed, decodeRgb8(testing.allocator, packet, .{ .concurrency = threads }));
+    }
+}
+
+test "a header whose coded rows do not cover the picture is refused" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    // Macroblock rows at 0x16c: none, then one short of 184 lines (12 rows)
+    for ([_]u16{ 0, 11 }) |rows| {
+        std.mem.writeInt(u16, packet[0x16c..][0..2], rows, .big);
+        for ([_]u2{ 0, 1 }) |log2| {
+            try testing.expectError(error.InvalidDnxHeader, decodeRgb8(testing.allocator, packet, .{ .log2_downscale = log2 }));
+            try testing.expectError(error.InvalidDnxHeader, decodeYuv16(testing.allocator, packet, .{ .log2_downscale = log2 }));
+        }
     }
 }
