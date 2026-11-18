@@ -2,6 +2,7 @@ pub const header = @import("header.zig");
 pub const huffman = @import("huffman.zig");
 pub const tables = @import("tables.zig");
 pub const decode = @import("decode.zig");
+pub const frame_decoder = @import("frame_decoder.zig");
 
 pub const FrameHeader = header.FrameHeader;
 pub const parseFrameHeader = header.parseFrameHeader;
@@ -14,4 +15,5 @@ test {
     _ = header;
     _ = huffman;
     _ = decode;
+    _ = frame_decoder;
 }

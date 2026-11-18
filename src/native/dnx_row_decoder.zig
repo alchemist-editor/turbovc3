@@ -8,7 +8,7 @@ const MAX_MACROBLOCKS = 256;
 const MAX_ROWS = 256;
 const MAX_BLOCKS_PER_MACROBLOCK = 12;
 const MAX_BLOCKS = MAX_MACROBLOCKS * MAX_BLOCKS_PER_MACROBLOCK;
-const LOOKUP_SIZE = 1 << 16;
+pub const LOOKUP_SIZE = 1 << 16;
 const MAX_AC_INFO = 1024;
 const MAX_RUN_VALUES = 64;
 
@@ -32,7 +32,7 @@ var diagnostic_macroblock: u32 = 0;
 var diagnostic_block: u32 = 0;
 var diagnostic_bit_offset: u32 = 0;
 
-const zigzag = [64]u8{
+pub const zigzag = [64]u8{
     0,  1,  8,  16, 9,  2,  3,  10,
     17, 24, 32, 25, 18, 11, 4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -43,7 +43,41 @@ const zigzag = [64]u8{
     53, 60, 61, 54, 47, 55, 62, 63,
 };
 
-const DecodeError = enum(u32) {
+/// The entropy and quantiser tables one decode reads. The WASM exports fill
+/// module globals and decode through `global_tables`; the native frame
+/// decoder (`dnx/frame_decoder.zig`) builds its own, so several frames or
+/// rows can decode at once.
+pub const Tables = struct {
+    dc_lookup: *const [LOOKUP_SIZE]u16,
+    ac_lookup: *const [LOOKUP_SIZE]u16,
+    run_lookup: *const [LOOKUP_SIZE]u16,
+    ac_info: []const u16,
+    run_values: []const u8,
+    luma_weight: *const [64]u16,
+    chroma_weight: *const [64]u16,
+    eob_index: u32,
+    index_bits: u32,
+    level_bias: i32,
+    level_shift: u32,
+};
+
+fn globalTables(ac_info_length: u32, run_values_length: u32, eob_index: u32, index_bits: u32, level_bias: i32, level_shift: u32) Tables {
+    return .{
+        .dc_lookup = &dc_lookup,
+        .ac_lookup = &ac_lookup,
+        .run_lookup = &run_lookup,
+        .ac_info = ac_info[0..ac_info_length],
+        .run_values = run_values[0..run_values_length],
+        .luma_weight = &luma_weight,
+        .chroma_weight = &chroma_weight,
+        .eob_index = eob_index,
+        .index_bits = index_bits,
+        .level_bias = level_bias,
+        .level_shift = level_shift,
+    };
+}
+
+pub const DecodeError = enum(u32) {
     ok = 0,
     invalid_arguments = 1,
     macroblock_header = 2,
@@ -57,7 +91,7 @@ const DecodeError = enum(u32) {
     ac_vlc = 10,
 };
 
-const BitReader = struct {
+pub const BitReader = struct {
     bytes: []const u8,
     byte_offset: usize = 0,
     bits_read: usize = 0,
@@ -68,7 +102,7 @@ const BitReader = struct {
         return self.cached_bits + (self.bytes.len - self.byte_offset) * 8;
     }
 
-    inline fn readBits(self: *BitReader, count: usize) ?u32 {
+    pub inline fn readBits(self: *BitReader, count: usize) ?u32 {
         if (count > self.bitsRemaining()) return null;
         if (count == 0) return 0;
         if (self.cached_bits < count) self.refill();
@@ -77,7 +111,7 @@ const BitReader = struct {
         return value;
     }
 
-    inline fn readSymbol(self: *BitReader, lookup: *const [LOOKUP_SIZE]u16) ?u32 {
+    pub inline fn readSymbol(self: *BitReader, lookup: *const [LOOKUP_SIZE]u16) ?u32 {
         if (self.bitsRemaining() == 0) return null;
         if (self.cached_bits < 16) self.refill();
         const prefix: u16 = @truncate(self.cache >> 48);
@@ -503,6 +537,78 @@ pub export fn dnx_idct_blocks(block_count: u32, bit_depth: u32) u32 {
     return @backingInt(DecodeError.ok);
 }
 
+/// Parses one 8x8 block into `out` (zeroed by the caller), in transposed
+/// natural order (`u * 8 + v`, horizontal frequency first), dequantised.
+pub inline fn decodeBlockInto(
+    tables: *const Tables,
+    reader: *BitReader,
+    out: *[64]i32,
+    block_index: usize,
+    last_dc: *[3]i32,
+    luma_scale: *const [64]i32,
+    chroma_scale: *const [64]i32,
+    is_444: bool,
+    dc_shift: u32,
+    has_ac: *bool,
+) DecodeError {
+    const component: usize = if (is_444)
+        (block_index >> 1) % 3
+    else if ((block_index & 2) != 0)
+        1 + (block_index & 1)
+    else
+        0;
+    const scale = if (component == 0) luma_scale else chroma_scale;
+    const weight = if (component == 0) tables.luma_weight else tables.chroma_weight;
+    const dc_len = reader.readSymbol(tables.dc_lookup) orelse return .dc_vlc;
+    if (dc_len > 31) return .dc_vlc;
+
+    if (dc_len > 0) {
+        const delta_bits = reader.readBits(dc_len) orelse return .dc_delta;
+        const positive_threshold: u32 = @as(u32, 1) << @intCast(dc_len - 1);
+        const delta: i32 = if (delta_bits < positive_threshold)
+            @as(i32, @intCast(delta_bits)) - @as(i32, @intCast((@as(u32, 1) << @intCast(dc_len)) - 1))
+        else
+            @intCast(delta_bits);
+        last_dc[component] += delta * (@as(i32, 1) << @intCast(dc_shift));
+    }
+
+    out[0] = last_dc[component];
+    var coefficient_index: usize = 0;
+    const eob_index = tables.eob_index;
+    var ac_index = reader.readSymbol(tables.ac_lookup) orelse return .ac_vlc;
+    has_ac.* = ac_index != eob_index;
+
+    while (ac_index != eob_index) {
+        const info_index = ac_index * 2;
+        if (info_index + 1 >= tables.ac_info.len) return .ac_vlc;
+        const level_base: u32 = tables.ac_info[info_index];
+        const flags: u16 = tables.ac_info[info_index + 1];
+        const sign_bit = reader.readBits(1) orelse return .ac_sign;
+        var level = level_base;
+
+        if ((flags & 1) != 0) {
+            const extra = reader.readBits(tables.index_bits) orelse return .ac_level;
+            level += extra << 7;
+        }
+        if ((flags & 2) != 0) {
+            const run_symbol = reader.readSymbol(tables.run_lookup) orelse return .run_vlc;
+            if (run_symbol >= tables.run_values.len) return .run_vlc;
+            coefficient_index += tables.run_values[run_symbol];
+        }
+
+        coefficient_index += 1;
+        if (coefficient_index > 63) return .coefficient_overrun;
+        const natural_index = zigzag[coefficient_index];
+        var value: i32 = @as(i32, @intCast(level)) * scale[coefficient_index];
+        value += scale[coefficient_index] >> 1;
+        if (tables.level_bias < 32 or weight[coefficient_index] != tables.level_bias) value += tables.level_bias;
+        value >>= @intCast(tables.level_shift);
+        out[natural_index] = if (sign_bit != 0) -value else value;
+        ac_index = reader.readSymbol(tables.ac_lookup) orelse return .ac_vlc;
+    }
+    return .ok;
+}
+
 inline fn decodeBlock(
     reader: *BitReader,
     block: usize,
@@ -520,62 +626,8 @@ inline fn decodeBlock(
     dc_shift: u32,
     has_ac: *bool,
 ) DecodeError {
-    const component: usize = if (is_444)
-        (block_index >> 1) % 3
-    else if ((block_index & 2) != 0)
-        1 + (block_index & 1)
-    else
-        0;
-    const scale = if (component == 0) luma_scale else chroma_scale;
-    const weight = if (component == 0) &luma_weight else &chroma_weight;
-    const dc_len = reader.readSymbol(&dc_lookup) orelse return .dc_vlc;
-    if (dc_len > 31) return .dc_vlc;
-
-    if (dc_len > 0) {
-        const delta_bits = reader.readBits(dc_len) orelse return .dc_delta;
-        const positive_threshold: u32 = @as(u32, 1) << @intCast(dc_len - 1);
-        const delta: i32 = if (delta_bits < positive_threshold)
-            @as(i32, @intCast(delta_bits)) - @as(i32, @intCast((@as(u32, 1) << @intCast(dc_len)) - 1))
-        else
-            @intCast(delta_bits);
-        last_dc[component] += delta * (@as(i32, 1) << @intCast(dc_shift));
-    }
-
-    const block_offset = block * 64;
-    coefficients[block_offset] = last_dc[component];
-    var coefficient_index: usize = 0;
-    var ac_index = reader.readSymbol(&ac_lookup) orelse return .ac_vlc;
-    has_ac.* = ac_index != eob_index;
-
-    while (ac_index != eob_index) {
-        const info_index = ac_index * 2;
-        if (info_index + 1 >= ac_info_length) return .ac_vlc;
-        const level_base: u32 = ac_info[info_index];
-        const flags: u16 = ac_info[info_index + 1];
-        const sign_bit = reader.readBits(1) orelse return .ac_sign;
-        var level = level_base;
-
-        if ((flags & 1) != 0) {
-            const extra = reader.readBits(index_bits) orelse return .ac_level;
-            level += extra << 7;
-        }
-        if ((flags & 2) != 0) {
-            const run_symbol = reader.readSymbol(&run_lookup) orelse return .run_vlc;
-            if (run_symbol >= run_values_length) return .run_vlc;
-            coefficient_index += run_values[run_symbol];
-        }
-
-        coefficient_index += 1;
-        if (coefficient_index > 63) return .coefficient_overrun;
-        const natural_index = zigzag[coefficient_index];
-        var value: i32 = @as(i32, @intCast(level)) * scale[coefficient_index];
-        value += scale[coefficient_index] >> 1;
-        if (level_bias < 32 or weight[coefficient_index] != level_bias) value += level_bias;
-        value >>= @intCast(level_shift);
-        coefficients[block_offset + natural_index] = if (sign_bit != 0) -value else value;
-        ac_index = reader.readSymbol(&ac_lookup) orelse return .ac_vlc;
-    }
-    return .ok;
+    const tables = globalTables(ac_info_length, run_values_length, eob_index, index_bits, level_bias, level_shift);
+    return decodeBlockInto(&tables, reader, coefficients[block * 64 ..][0..64], block_index, last_dc, luma_scale, chroma_scale, is_444, dc_shift, has_ac);
 }
 
 fn inverseDctBlocks(output_coefficients: [*]const i32, output_samples: [*]u16, block_count: usize, bit_depth: u32) void {

@@ -320,6 +320,14 @@
       "width": 7680,
       "height": 4320,
       "pixelFormat": "yuv422p10"
+    },
+    {
+      "path": "dnxhr_hq_328x184.mxf",
+      "sha256": "be5872a6c58e790d5dd5f4d4c443c221be2da085c5b606590792c15e75b41f0f",
+      "cid": 1272,
+      "width": 328,
+      "height": 184,
+      "pixelFormat": "yuv422p8"
     }
   ]
 }

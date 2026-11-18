@@ -6,6 +6,12 @@ All notable changes to turbovc3 will be documented here.
 
 ### Added
 
+- Native Zig `dnx.frame_decoder`: decodes a frame's macroblock rows on several threads (`concurrency`, 0 for the
+  CPU count), keeps every buffer per call so frames can decode at once, and can decode at 1/2, 1/4 or 1/8 of the
+  frame's size (`log2_downscale`) with a reduced inverse DCT of each block's lowest frequencies. `decodeYuv16` returns
+  planar Y'CbCr at the source bit depth; `decodeRgb8` returns what `decodeFrameRgb8` does. Full-size output matches the
+  row decoder sample for sample. The WASM row decoder's block parse is shared with it (`decodeBlockInto`) and
+  unchanged.
 - `registerDnxDecoder(options)`: the backend (`useSharedMemory`), the WebAssembly and worker URLs, an
   `onWorkerStartError` hook for worker backends that fail to start, and the shared decoder's idle time. With no options
   it behaves as before.
