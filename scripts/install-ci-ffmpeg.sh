@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# Puts a static FFmpeg on CI's PATH. The tests use it for one remux
+# Puts a static FFmpeg 8.1 on CI's PATH. The tests use it for one remux
 # (tests/dnx-oracle-test.mjs tags a committed fixture with container colour
-# metadata), so any recent FFmpeg does.
+# metadata).
 #
-# This replaced `apt-get install ffmpeg`, which pulls a few hundred packages
-# from Ubuntu's mirrors and once hung a run for over ten minutes. The build is
-# ffmpeg-static's FFmpeg 7.0.2 (John Van Sickle's static amd64 build), a single
-# file served from GitHub's release storage, pinned by SHA-256.
+# This replaced `apt-get install ffmpeg`, which pulled a few hundred packages
+# (FFmpeg 6.1) from Ubuntu's mirrors and once hung a run for over ten minutes.
+# The build is BtbN's static linux64 FFmpeg, the 8.1 release branch, from
+# GitHub's release storage. That asset is rebuilt as 8.1 point releases and
+# fixes land, so it carries no checksum; the version check below fails the
+# step if it ever stops being 8.x.
 set -euo pipefail
 
-url="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-x64.gz"
-sha256="bfe8a8fc511530457b528c48d77b5737527b504a3797a9bc4866aeca69c2dffa"
+series="8.1"
+url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${series}-latest-linux64-gpl-${series}.tar.xz"
 dir="${RUNNER_TEMP:-/tmp}/ffmpeg-static"
 
 mkdir -p "$dir"
 curl --fail --location --silent --show-error \
-  --retry 5 --retry-all-errors --connect-timeout 15 --max-time 120 \
-  --output "$dir/ffmpeg.gz" "$url"
-echo "$sha256  $dir/ffmpeg.gz" | sha256sum --check --strict
-gunzip --force "$dir/ffmpeg.gz"
-chmod +x "$dir/ffmpeg"
-"$dir/ffmpeg" -hide_banner -version | head -n 1
+  --retry 5 --retry-all-errors --connect-timeout 15 --max-time 180 \
+  --output "$dir/ffmpeg.tar.xz" "$url"
+tar -xJf "$dir/ffmpeg.tar.xz" -C "$dir" --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+rm "$dir/ffmpeg.tar.xz"
+
+version="$("$dir/ffmpeg" -hide_banner -version | head -n 1)"
+echo "$version"
+case "$version" in
+  "ffmpeg version n8."*|"ffmpeg version 8."*) ;;
+  *) echo "Expected FFmpeg 8.x from $url" >&2; exit 1 ;;
+esac
 
 if [ -n "${GITHUB_PATH:-}" ]; then
   echo "$dir" >> "$GITHUB_PATH"
