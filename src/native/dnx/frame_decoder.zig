@@ -30,6 +30,7 @@ pub const Error = error{
     UnsupportedDownscale,
     DnxDecodeFailed,
     TooManyRows,
+    TargetTooSmall,
 } || std.mem.Allocator.Error || std.Thread.SpawnError;
 
 pub const Options = struct {
@@ -77,7 +78,7 @@ pub const YuvFrame = struct {
 pub fn decodeYuv16(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!YuvFrame {
     var job = try Job.init(allocator, packet, options);
     defer job.deinit();
-    try job.run(null);
+    try job.run(.planar);
     return job.takeYuv();
 }
 
@@ -89,9 +90,78 @@ pub fn decodeRgb8(allocator: std.mem.Allocator, packet: []const u8, options: Opt
     const stride: usize = @as(usize, job.width) * 3;
     const rgb = try allocator.alloc(u8, stride * job.height);
     errdefer allocator.free(rgb);
-    try job.run(rgb);
+    try job.run(.{ .rgb8 = rgb });
     return .{ .data = rgb, .width = job.width, .height = job.height, .stride_bytes = stride, .allocator = allocator };
 }
+
+/// A host's biplanar Y'CbCr planes (P010/P210/P410 layout): a luma plane of
+/// u16 samples, then interleaved Cb,Cr pairs (one pair per two pixels for
+/// 4:2:2, per pixel for 4:4:4), each sample in the high bits of its
+/// little-endian u16 whatever the source's bit depth. Each plane holds
+/// `height` rows at its stride; bytes past a row's samples are left alone.
+pub const Biplanar = struct {
+    luma: []u8,
+    luma_stride_bytes: usize,
+    chroma: []u8,
+    chroma_stride_bytes: usize,
+
+    fn fits(self: Biplanar, width: u32, height: u32, is_444: bool) bool {
+        if (width == 0 or height == 0) return true;
+        const pairs: usize = if (is_444) width else (@as(usize, width) + 1) / 2;
+        const luma_row = @as(usize, width) * 2;
+        const chroma_row = pairs * 4;
+        if (self.luma_stride_bytes < luma_row or self.chroma_stride_bytes < chroma_row) return false;
+        const rows = @as(usize, height) - 1;
+        return self.luma.len >= rows * self.luma_stride_bytes + luma_row and
+            self.chroma.len >= rows * self.chroma_stride_bytes + chroma_row;
+    }
+};
+
+/// One frame's decode in two steps, so a caller can size (or borrow) its
+/// planes from the frame's header first: `init` parses the header and knows
+/// the output size; `decodeBiplanar` decodes on every thread, each thread
+/// writing its own rows straight into the planes, so there is no pass over
+/// the whole frame after the decode.
+pub const Prepared = struct {
+    job: Job,
+
+    pub fn init(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!Prepared {
+        return .{ .job = try Job.init(allocator, packet, options) };
+    }
+
+    pub fn deinit(self: *Prepared) void {
+        self.job.deinit();
+        self.* = undefined;
+    }
+
+    /// The visible size the decode writes (reduced by `log2_downscale`).
+    pub fn width(self: Prepared) u32 {
+        return self.job.width;
+    }
+    pub fn height(self: Prepared) u32 {
+        return self.job.height;
+    }
+    pub fn bitDepth(self: Prepared) u8 {
+        return self.job.hdr.bit_depth;
+    }
+    pub fn is444(self: Prepared) bool {
+        return self.job.hdr.is_444;
+    }
+
+    /// Decodes into `target`; `TargetTooSmall` (nothing written) when its
+    /// planes cannot hold `width` x `height`. Call once.
+    pub fn decodeBiplanar(self: *Prepared, target: Biplanar) Error!void {
+        if (!target.fits(self.job.width, self.job.height, self.job.hdr.is_444)) return error.TargetTooSmall;
+        try self.job.run(.{ .biplanar = target });
+    }
+};
+
+/// What each band writes once its macroblock rows are decoded.
+const Output = union(enum) {
+    planar,
+    rgb8: []u8,
+    biplanar: Biplanar,
+};
 
 const Job = struct {
     allocator: std.mem.Allocator,
@@ -180,7 +250,7 @@ const Job = struct {
         };
     }
 
-    fn run(self: *Job, rgb: ?[]u8) Error!void {
+    fn run(self: *Job, output: Output) Error!void {
         const t = self.tables;
         self.row_tables = .{
             .dc_lookup = &t.dc_lookup,
@@ -206,16 +276,16 @@ const Job = struct {
         defer for (handles[0..spawned]) |h| h.join();
         var band: u32 = 1;
         while (band < threads) : (band += 1) {
-            handles[spawned] = try std.Thread.spawn(.{}, bandWorker, .{ self, rgb, band, threads });
+            handles[spawned] = try std.Thread.spawn(.{}, bandWorker, .{ self, output, band, threads });
             spawned += 1;
         }
-        bandWorker(self, rgb, 0, threads);
+        bandWorker(self, output, 0, threads);
         for (handles[0..spawned]) |h| h.join();
         spawned = 0;
         if (self.failed.load(.acquire) != 0) return error.DnxDecodeFailed;
     }
 
-    fn bandWorker(self: *Job, rgb: ?[]u8, band: u32, bands: u32) void {
+    fn bandWorker(self: *Job, output: Output, band: u32, bands: u32) void {
         const rows: u32 = self.hdr.macroblock_height;
         const first = rows * band / bands;
         const last = rows * (band + 1) / bands;
@@ -227,7 +297,11 @@ const Job = struct {
                 return;
             }
         }
-        if (rgb) |out| self.convertRows(out, first, last);
+        switch (output) {
+            .planar => {},
+            .rgb8 => |out| self.convertRows(out, first, last),
+            .biplanar => |out| self.packRows(out, first, last),
+        }
     }
 
     fn decodeRow(self: *Job, r: u32) row.DecodeError {
@@ -369,6 +443,44 @@ const Job = struct {
             else
                 self.convertRowsAs(false, s, rgb, first, last),
             else => unreachable,
+        }
+    }
+
+    /// The pixel rows macroblock rows `first`..`last` produced, into the
+    /// host's biplanar planes with each sample moved to the u16's high bits.
+    fn packRows(self: *Job, target: Biplanar, first: u32, last: u32) void {
+        switch (self.hdr.bit_depth) {
+            inline 8, 10, 12 => |depth| if (self.hdr.is_444)
+                self.packRowsAs(true, 16 - depth, target, first, last)
+            else
+                self.packRowsAs(false, 16 - depth, target, first, last),
+            else => unreachable,
+        }
+    }
+
+    fn packRowsAs(self: *Job, comptime is_444: bool, comptime shift: u4, target: Biplanar, first: u32, last: u32) void {
+        const rows_per_mb: u32 = @as(u32, 16) >> @as(u5, self.log2);
+        const y_begin = first * rows_per_mb;
+        const y_end = @min(last * rows_per_mb, self.height);
+        const plane_width: usize = self.plane_width;
+        const chroma_width: usize = self.chroma_width;
+        const y_plane = self.yuv[0 .. plane_width * self.plane_height];
+        const cb_plane = self.yuv[y_plane.len..][0 .. chroma_width * self.plane_height];
+        const cr_plane = self.yuv[y_plane.len + cb_plane.len ..][0 .. chroma_width * self.plane_height];
+        const width: usize = self.width;
+        const pairs: usize = if (is_444) width else (width + 1) / 2;
+        var y: usize = y_begin;
+        while (y < y_end) : (y += 1) {
+            const luma_in = y_plane[y * plane_width ..][0..width];
+            const luma_out = target.luma[y * target.luma_stride_bytes ..][0 .. width * 2];
+            for (luma_in, 0..) |sample, x| std.mem.writeInt(u16, luma_out[x * 2 ..][0..2], sample << shift, .little);
+            const cb_in = cb_plane[y * chroma_width ..][0..pairs];
+            const cr_in = cr_plane[y * chroma_width ..][0..pairs];
+            const chroma_out = target.chroma[y * target.chroma_stride_bytes ..][0 .. pairs * 4];
+            for (cb_in, cr_in, 0..) |cb, cr, x| {
+                std.mem.writeInt(u16, chroma_out[x * 4 ..][0..2], cb << shift, .little);
+                std.mem.writeInt(u16, chroma_out[x * 4 + 2 ..][0..2], cr << shift, .little);
+            }
         }
     }
 
@@ -623,4 +735,66 @@ test "a header whose coded rows do not cover the picture is refused" {
             try testing.expectError(error.InvalidDnxHeader, decodeYuv16(testing.allocator, packet, .{ .log2_downscale = log2 }));
         }
     }
+}
+
+test "biplanar output is the planar decode moved to the high bits, at every size and thread count" {
+    var checked: usize = 0;
+    for (progressive_fixtures) |path| {
+        const packet = try readFirstPacket(path);
+        defer testing.allocator.free(packet);
+        for ([_]u2{ 0, 1, 2, 3 }) |log2| {
+            var planar = decodeYuv16(testing.allocator, packet, .{ .log2_downscale = log2, .concurrency = 1 }) catch |err| switch (err) {
+                error.UnsupportedDownscale => continue,
+                else => return err,
+            };
+            defer planar.deinit();
+            const shift: u4 = @intCast(16 - planar.bit_depth);
+            const pairs: usize = if (planar.is_444) planar.width else (@as(usize, planar.width) + 1) / 2;
+            // Strides wider than a row, and padding the decode must not touch.
+            const luma_stride = @as(usize, planar.width) * 2 + 6;
+            const chroma_stride = pairs * 4 + 10;
+            const luma = try testing.allocator.alloc(u8, luma_stride * planar.height);
+            defer testing.allocator.free(luma);
+            const chroma = try testing.allocator.alloc(u8, chroma_stride * planar.height);
+            defer testing.allocator.free(chroma);
+            for ([_]u32{ 1, 3, 8 }) |threads| {
+                @memset(luma, 0xa5);
+                @memset(chroma, 0xa5);
+                var prepared = try Prepared.init(testing.allocator, packet, .{ .log2_downscale = log2, .concurrency = threads });
+                defer prepared.deinit();
+                try testing.expectEqual(planar.width, prepared.width());
+                try testing.expectEqual(planar.height, prepared.height());
+                try prepared.decodeBiplanar(.{ .luma = luma, .luma_stride_bytes = luma_stride, .chroma = chroma, .chroma_stride_bytes = chroma_stride });
+                for (0..planar.height) |y| {
+                    for (0..planar.width) |x| {
+                        const got = std.mem.readInt(u16, luma[y * luma_stride + x * 2 ..][0..2], .little);
+                        try testing.expectEqual(planar.luma()[y * planar.plane_width + x] << shift, got);
+                    }
+                    for (0..pairs) |x| {
+                        const cb = std.mem.readInt(u16, chroma[y * chroma_stride + x * 4 ..][0..2], .little);
+                        const cr = std.mem.readInt(u16, chroma[y * chroma_stride + x * 4 + 2 ..][0..2], .little);
+                        try testing.expectEqual(planar.cb()[y * planar.chroma_width + x] << shift, cb);
+                        try testing.expectEqual(planar.cr()[y * planar.chroma_width + x] << shift, cr);
+                    }
+                    for (luma[y * luma_stride + @as(usize, planar.width) * 2 ..][0..6]) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+                    for (chroma[y * chroma_stride + pairs * 4 ..][0..10]) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+                }
+                checked += 1;
+            }
+        }
+    }
+    try testing.expect(checked > 0);
+}
+
+test "biplanar output refuses planes too small for the frame" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    var prepared = try Prepared.init(testing.allocator, packet, .{ .log2_downscale = 3 });
+    defer prepared.deinit();
+    // 1/8 of 328x184 is 41x23: an odd width, so 21 chroma pairs a row.
+    try testing.expectEqual(@as(u32, 41), prepared.width());
+    var luma: [82 * 23]u8 = undefined;
+    var chroma: [84 * 23]u8 = undefined;
+    try testing.expectError(error.TargetTooSmall, prepared.decodeBiplanar(.{ .luma = &luma, .luma_stride_bytes = 82, .chroma = &chroma, .chroma_stride_bytes = 82 }));
+    try prepared.decodeBiplanar(.{ .luma = &luma, .luma_stride_bytes = 82, .chroma = &chroma, .chroma_stride_bytes = 84 });
 }
