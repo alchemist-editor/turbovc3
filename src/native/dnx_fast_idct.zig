@@ -29,7 +29,13 @@ const A = [6]f32{
     0.382683432365089771728460,
 };
 
-const scale_matrix = blk: {
+/// The multipliers `idctColumns` uses, for the AVX2 kernel to use unchanged.
+pub const idct_factors = blk: {
+    const denominator = 2.0 / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
+    break :blk [5]f32{ A[5] * denominator, A[4] * denominator, A[2] * denominator, 1.0 / A[3], 1.0 / A[1] };
+};
+
+pub const scale_matrix = blk: {
     var result: [64]f32 = undefined;
     for (0..8) |y| {
         for (0..8) |x| {
@@ -54,18 +60,22 @@ pub inline fn transformBlock(coefficients: [*]const i32, output: [*]u16, maximum
     rows = transposeRows(rows);
     rows = idctColumns(rows);
 
+    // floor(value + 0.5) clamped to 0..maximum. Clamping first leaves a
+    // non-negative value, whose truncation is its floor, so this needs no
+    // floor instruction (baseline x86-64 has none, and would call out for
+    // every sample).
     inline for (0..8) |row| {
-        const rounded = @floor(rows[row] + @as(V8, @splat(0.5)));
-        const clamped = @min(@max(rounded, @as(V8, @splat(0))), @as(V8, @splat(@floatFromInt(maximum))));
-        const as_u32: @Vector(8, u32) = @intFromFloat(clamped);
-        const as_u16: @Vector(8, u16) = @intCast(as_u32);
+        const offset = rows[row] + @as(V8, @splat(0.5));
+        const clamped = @min(@max(offset, @as(V8, @splat(0))), @as(V8, @splat(@floatFromInt(maximum))));
+        const as_i32: @Vector(8, i32) = @intFromFloat(clamped);
+        const as_u16: @Vector(8, u16) = @intCast(as_i32);
         output[row * 8 ..][0..8].* = as_u16;
     }
 }
 
 pub inline fn transformDcBlock(coefficient: i32, output: [*]u16, maximum: u16) void {
-    const rounded = @floor(@as(f32, @floatFromInt(coefficient)) * 0.125 + 0.5);
-    const clamped = @min(@max(rounded, 0), @as(f32, @floatFromInt(maximum)));
+    const offset = @as(f32, @floatFromInt(coefficient)) * 0.125 + 0.5;
+    const clamped = @min(@max(offset, 0), @as(f32, @floatFromInt(maximum)));
     @memset(output[0..64], @intFromFloat(clamped));
 }
 

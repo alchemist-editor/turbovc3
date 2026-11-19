@@ -1,4 +1,5 @@
 const std = @import("std");
+const row = @import("../dnx_row_decoder.zig");
 const tables = @import("tables.zig");
 
 pub const LOOKUP_SIZE = 1 << 16;
@@ -15,6 +16,8 @@ pub const TableSet = struct {
     level_shift: u32,
     luma_weight: []const u16,
     chroma_weight: []const u16,
+    /// Filled for the shared sets only (`sharedTableForCid`).
+    fast: row.FastTables = undefined,
 };
 
 fn buildLookup(codes: []const u32, bits: []const u8, out: *[LOOKUP_SIZE]u16) void {
@@ -52,6 +55,47 @@ fn buildLookupU16(codes: []const u16, bits: []const u8, out: *[LOOKUP_SIZE]u16) 
     const n = @min(codes.len, wide.len);
     for (0..n) |i| wide[i] = codes[i];
     buildLookup(wide[0..n], bits[0..n], out);
+}
+
+/// One set of lookups per table family, built by the first frame that needs
+/// it and shared by every frame after.
+const SharedTable = struct {
+    state: std.atomic.Value(u8) = .init(empty),
+    set: TableSet = undefined,
+
+    const empty = 0;
+    const building = 1;
+    const ready = 2;
+};
+
+var shared_tables: [3]SharedTable = @splat(.{});
+
+fn familyForCid(cid: u32) ?struct { index: usize, cid: u32 } {
+    return switch (cid) {
+        1237, 1273, 1274, 1253, 1259 => .{ .index = 0, .cid = 1237 },
+        1238, 1272, 1243 => .{ .index = 1, .cid = 1238 },
+        1235 => .{ .index = 2, .cid = 1235 },
+        else => null,
+    };
+}
+
+/// `tableForCid`, without rebuilding the lookups for every frame.
+pub fn sharedTableForCid(cid: u32) ?*const TableSet {
+    const family = familyForCid(cid) orelse return null;
+    const slot = &shared_tables[family.index];
+    if (slot.state.load(.acquire) == SharedTable.ready) return &slot.set;
+    if (slot.state.cmpxchgStrong(SharedTable.empty, SharedTable.building, .acquire, .acquire) == null) {
+        fillTableSet(&slot.set, family.cid);
+        slot.state.store(SharedTable.ready, .release);
+    } else {
+        while (slot.state.load(.acquire) != SharedTable.ready) std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    return &slot.set;
+}
+
+fn fillTableSet(out: *TableSet, cid: u32) void {
+    out.* = tableForCid(cid).?;
+    out.fast.fill(&out.dc_lookup, &out.ac_lookup, &out.run_lookup, out.ac_info, out.run, out.eob_index);
 }
 
 pub fn tableForCid(cid: u32) ?TableSet {
@@ -115,6 +159,22 @@ pub fn tableForCid(cid: u32) ?TableSet {
         return set;
     }
     return null;
+}
+
+test "the shared tables are the ones tableForCid builds, one set per family" {
+    for ([_]u32{ 1237, 1273, 1274, 1253, 1259, 1238, 1272, 1243, 1235 }) |cid| {
+        const built = tableForCid(cid).?;
+        const shared = sharedTableForCid(cid).?;
+        try std.testing.expectEqualSlices(u16, &built.dc_lookup, &shared.dc_lookup);
+        try std.testing.expectEqualSlices(u16, &built.ac_lookup, &shared.ac_lookup);
+        try std.testing.expectEqualSlices(u16, &built.run_lookup, &shared.run_lookup);
+        try std.testing.expectEqualSlices(u16, built.ac_info, shared.ac_info);
+        try std.testing.expectEqualSlices(u8, built.run, shared.run);
+        try std.testing.expectEqualSlices(u16, built.luma_weight, shared.luma_weight);
+        try std.testing.expectEqualSlices(u16, built.chroma_weight, shared.chroma_weight);
+    }
+    try std.testing.expectEqual(sharedTableForCid(1272).?, sharedTableForCid(1238).?);
+    try std.testing.expectEqual(@as(?*const TableSet, null), sharedTableForCid(1));
 }
 
 test "1237 zigLookup matches oracle fingerprint samples" {
