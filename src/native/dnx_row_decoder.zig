@@ -59,6 +59,114 @@ pub const Tables = struct {
     index_bits: u32,
     level_bias: i32,
     level_shift: u32,
+    /// Tests turn this off to compare against bit-by-bit checked reads.
+    batch_reads: bool = true,
+    /// Small first-level tables. The native decoder has them; without them
+    /// (the WASM build) every symbol goes through the full lookups.
+    fast: ?*const FastTables = null,
+};
+
+/// First-level tables over the leading bits of each code. The full lookups are
+/// 128 KiB each, and because a short code fills thousands of their entries,
+/// decoding walks all over them; these fit in the L1 cache alongside the
+/// decoder's other data. An AC entry usually holds a whole coefficient (code,
+/// sign and run, when they fit in the prefix), so one load replaces the chain
+/// of lookups and the unpredictable branches on what follows each code.
+/// An entry of 0 means "use the full lookups", which also report bad codes.
+pub const FastTables = struct {
+    ac: [1 << ac_bits]u32,
+    run: [1 << run_bits]u16,
+    dc: [1 << dc_bits]u16,
+
+    pub const ac_bits = 12;
+    pub const run_bits = 9;
+    pub const dc_bits = 9;
+
+    // An AC entry. `ac_partial` entries cover the code alone: the sign, level
+    // index and run are still in the stream. The others cover all of it.
+    const ac_length_mask: u32 = 0x1f;
+    const ac_has_index_shift = 5;
+    const ac_has_run_shift = 6;
+    const ac_end_of_block: u32 = 1 << 7;
+    const ac_partial: u32 = 1 << 8;
+    const ac_sign_shift = 9;
+    const ac_run_shift = 10;
+    const ac_run_mask: u32 = 0x3f;
+    const ac_level_shift = 16;
+
+    const max_fast_dc_bits = 16;
+
+    pub fn fill(
+        self: *FastTables,
+        dc: *const [LOOKUP_SIZE]u16,
+        ac: *const [LOOKUP_SIZE]u16,
+        run: *const [LOOKUP_SIZE]u16,
+        info: []const u16,
+        run_table: []const u8,
+        eob_index: u32,
+    ) void {
+        for (&self.ac, 0..) |*entry, prefix| {
+            entry.* = 0;
+            const symbol = resolved(ac, prefix, ac_bits) orelse continue;
+            if (symbol.value == eob_index) {
+                entry.* = symbol.length | ac_end_of_block;
+                continue;
+            }
+            const index = @as(usize, symbol.value) * 2;
+            if (index + 1 >= info.len) continue;
+            const flags: u32 = info[index + 1];
+            const level: u32 = info[index];
+            const code_bits: u32 = symbol.length;
+            entry.* = code_bits | ac_partial |
+                ((flags & 1) << ac_has_index_shift) |
+                (((flags >> 1) & 1) << ac_has_run_shift) |
+                (level << ac_level_shift);
+
+            // The whole coefficient, when no level index follows and the sign
+            // and any run code also fit in the prefix.
+            if (flags & 1 != 0 or code_bits >= ac_bits) continue;
+            const sign_position: u5 = @intCast(ac_bits - code_bits - 1);
+            const sign: u32 = @intCast((prefix >> sign_position) & 1);
+            var run_value: u32 = 0;
+            var run_code_bits: u32 = 0;
+            if (flags & 2 != 0) {
+                if (sign_position == 0) continue;
+                const run_prefix = prefix & ((@as(usize, 1) << sign_position) - 1);
+                const run_symbol = resolved(run, run_prefix, sign_position) orelse continue;
+                if (run_symbol.value >= run_table.len) continue;
+                run_value = run_table[run_symbol.value];
+                run_code_bits = run_symbol.length;
+            }
+            if (run_value > ac_run_mask) continue;
+            entry.* = (code_bits + 1 + run_code_bits) |
+                (sign << ac_sign_shift) |
+                (run_value << ac_run_shift) |
+                (level << ac_level_shift);
+        }
+        for (&self.run, 0..) |*entry, prefix| {
+            entry.* = 0;
+            const symbol = resolved(run, prefix, run_bits) orelse continue;
+            if (symbol.value >= run_table.len) continue;
+            entry.* = symbol.length | (@as(u16, run_table[symbol.value]) << 8);
+        }
+        for (&self.dc, 0..) |*entry, prefix| {
+            entry.* = 0;
+            const symbol = resolved(dc, prefix, dc_bits) orelse continue;
+            if (symbol.value > max_fast_dc_bits) continue;
+            entry.* = symbol.length | (symbol.value << 8);
+        }
+    }
+
+    const Resolved = struct { length: u16, value: u16 };
+
+    /// The symbol a `bits`-long prefix decides, if its code fits in the prefix.
+    fn resolved(lookup: *const [LOOKUP_SIZE]u16, prefix: usize, bits: u5) ?Resolved {
+        const packed_value = lookup[prefix << (16 - bits)];
+        if (packed_value == 0) return null;
+        const length = (packed_value >> 12) + 1;
+        if (length > bits) return null;
+        return .{ .length = length, .value = (packed_value & 0x0fff) - 1 };
+    }
 };
 
 fn globalTables(ac_info_length: u32, run_values_length: u32, eob_index: u32, index_bits: u32, level_bias: i32, level_shift: u32) Tables {
@@ -77,6 +185,20 @@ fn globalTables(ac_info_length: u32, run_values_length: u32, eob_index: u32, ind
     };
 }
 
+/// One component's dequantiser at one qscale, indexed by scan position.
+pub const Quantiser = struct {
+    scale: [64]i32,
+    offset: [64]i32,
+
+    pub fn fill(self: *Quantiser, qscale: i32, weight: *const [64]u16, level_bias: i32) void {
+        for (weight, 0..) |w, index| {
+            const scale = qscale * @as(i32, w);
+            self.scale[index] = scale;
+            self.offset[index] = (scale >> 1) + (if (level_bias < 32 or w != level_bias) level_bias else 0);
+        }
+    }
+};
+
 pub const DecodeError = enum(u32) {
     ok = 0,
     invalid_arguments = 1,
@@ -94,36 +216,67 @@ pub const DecodeError = enum(u32) {
 pub const BitReader = struct {
     bytes: []const u8,
     byte_offset: usize = 0,
-    bits_read: usize = 0,
     cache: u64 = 0,
     cached_bits: usize = 0,
 
-    inline fn bitsRemaining(self: *const BitReader) usize {
-        return self.cached_bits + (self.bytes.len - self.byte_offset) * 8;
+    pub inline fn bitsRead(self: *const BitReader) usize {
+        return self.byte_offset * 8 - self.cached_bits;
     }
 
-    pub inline fn readBits(self: *BitReader, count: usize) ?u32 {
-        if (count > self.bitsRemaining()) return null;
-        if (count == 0) return 0;
+    /// Whether `count` bits (at most 56) are cached, refilling if needed.
+    inline fn ensure(self: *BitReader, count: usize) bool {
         if (self.cached_bits < count) self.refill();
+        return self.cached_bits >= count;
+    }
+
+    /// The next `count` bits (1 to 32), which `ensure` has made available.
+    inline fn takeBits(self: *BitReader, count: usize) u32 {
+        const value: u32 = @truncate(self.cache >> @intCast(64 - count));
+        self.consume(count);
+        return value;
+    }
+
+    /// `readSymbol` with 16 bits known to be cached.
+    inline fn takeSymbol(self: *BitReader, lookup: *const [LOOKUP_SIZE]u16) ?u32 {
+        const prefix: u16 = @truncate(self.cache >> 48);
+        const packed_value = lookup[prefix];
+        if (packed_value == 0) return null;
+        self.consume((packed_value >> 12) + 1);
+        return (packed_value & 0x0fff) - 1;
+    }
+
+    // A refill leaves at least 56 bits cached unless the input has run out,
+    // so after one, too few cached bits means too few bits remain.
+    pub inline fn readBits(self: *BitReader, count: usize) ?u32 {
+        if (count == 0) return 0;
+        if (self.cached_bits < count) {
+            self.refill();
+            if (self.cached_bits < count) return null;
+        }
         const value: u32 = @truncate(self.cache >> @intCast(64 - count));
         self.consume(count);
         return value;
     }
 
     pub inline fn readSymbol(self: *BitReader, lookup: *const [LOOKUP_SIZE]u16) ?u32 {
-        if (self.bitsRemaining() == 0) return null;
-        if (self.cached_bits < 16) self.refill();
+        if (self.cached_bits < 16) {
+            self.refill();
+            if (self.cached_bits == 0) return null;
+        }
         const prefix: u16 = @truncate(self.cache >> 48);
         const packed_value = lookup[prefix];
         if (packed_value == 0) return null;
         const bit_count = (packed_value >> 12) + 1;
-        if (bit_count > self.bitsRemaining()) return null;
+        if (bit_count > self.cached_bits) return null;
         self.consume(bit_count);
         return (packed_value & 0x0fff) - 1;
     }
 
     inline fn refill(self: *BitReader) void {
+        if (self.canRefillWhole()) {
+            self.refillWhole();
+            return;
+        }
         while (self.cached_bits <= 56 and self.byte_offset < self.bytes.len) {
             const shift: u6 = @intCast(56 - self.cached_bits);
             self.cache |= @as(u64, self.bytes[self.byte_offset]) << shift;
@@ -132,10 +285,23 @@ pub const BitReader = struct {
         }
     }
 
+    inline fn canRefillWhole(self: *const BitReader) bool {
+        return self.bytes.len - self.byte_offset >= 8;
+    }
+
+    /// Tops the cache up to 56 to 63 bits, with no branch on how many it held.
+    /// Bits of a partly taken byte also land in the cache; the next refill ORs
+    /// in the same bits. Needs `canRefillWhole`.
+    inline fn refillWhole(self: *BitReader) void {
+        const word = std.mem.readInt(u64, self.bytes[self.byte_offset..][0..8], .big);
+        self.cache |= word >> @intCast(self.cached_bits);
+        self.byte_offset += (63 - self.cached_bits) >> 3;
+        self.cached_bits |= 56;
+    }
+
     inline fn consume(self: *BitReader, count: usize) void {
         self.cache <<= @intCast(count);
         self.cached_bits -= count;
-        self.bits_read += count;
     }
 };
 
@@ -367,8 +533,8 @@ fn decodeRowIntoFrame(
         @as(i32, 1) << @intCast(bit_depth + 2),
     };
     var last_qscale: i32 = -1;
-    var luma_scale: [64]i32 = undefined;
-    var chroma_scale: [64]i32 = undefined;
+    var luma_quantiser: Quantiser = undefined;
+    var chroma_quantiser: Quantiser = undefined;
     const maximum: u16 = @intCast((@as(u32, 1) << @intCast(bit_depth)) - 1);
     const dc_shift: u32 = if (bit_depth == 12) 2 else 0;
 
@@ -376,7 +542,7 @@ fn decodeRowIntoFrame(
     while (macroblock < macroblock_width) : (macroblock += 1) {
         diagnostic_stage = 2;
         diagnostic_macroblock = @intCast(macroblock);
-        diagnostic_bit_offset = @intCast(reader.bits_read);
+        diagnostic_bit_offset = @intCast(reader.bitsRead());
         const interlaced = if (mbaff)
             (reader.readBits(1) orelse return .macroblock_header) != 0
         else
@@ -386,10 +552,8 @@ fn decodeRowIntoFrame(
 
         const qscale: i32 = @intCast(qscale_value);
         if (qscale != last_qscale) {
-            for (0..64) |index| {
-                luma_scale[index] = qscale * @as(i32, luma_weight[index]);
-                chroma_scale[index] = qscale * @as(i32, chroma_weight[index]);
-            }
+            luma_quantiser.fill(qscale, &luma_weight, level_bias);
+            chroma_quantiser.fill(qscale, &chroma_weight, level_bias);
             last_qscale = qscale;
         }
 
@@ -397,7 +561,7 @@ fn decodeRowIntoFrame(
         for (0..blocks_per_macroblock) |block_index| {
             diagnostic_stage = 3;
             diagnostic_block = @intCast(block_index);
-            diagnostic_bit_offset = @intCast(reader.bits_read);
+            diagnostic_bit_offset = @intCast(reader.bitsRead());
             @memset(coefficients[0..64], 0);
             var has_ac = false;
             const result = decodeBlock(
@@ -405,8 +569,8 @@ fn decodeRowIntoFrame(
                 0,
                 block_index,
                 &last_dc,
-                &luma_scale,
-                &chroma_scale,
+                &luma_quantiser,
+                &chroma_quantiser,
                 ac_info_length,
                 run_values_length,
                 eob_index,
@@ -418,7 +582,7 @@ fn decodeRowIntoFrame(
                 &has_ac,
             );
             if (result != .ok) {
-                diagnostic_bit_offset = @intCast(reader.bits_read);
+                diagnostic_bit_offset = @intCast(reader.bitsRead());
                 return result;
             }
 
@@ -442,7 +606,7 @@ fn decodeRowIntoFrame(
         }
     }
 
-    diagnostic_bit_offset = @intCast(reader.bits_read);
+    diagnostic_bit_offset = @intCast(reader.bitsRead());
     return .ok;
 }
 
@@ -472,39 +636,37 @@ fn decodeRowBytes(
         @as(i32, 1) << @intCast(bit_depth + 2),
     };
     var last_qscale: i32 = -1;
-    var luma_scale: [64]i32 = undefined;
-    var chroma_scale: [64]i32 = undefined;
+    var luma_quantiser: Quantiser = undefined;
+    var chroma_quantiser: Quantiser = undefined;
     const dc_shift: u32 = if (bit_depth == 12) 2 else 0;
 
     var macroblock: usize = 0;
     while (macroblock < macroblock_width) : (macroblock += 1) {
         diagnostic_stage = 2;
         diagnostic_macroblock = @intCast(macroblock);
-        diagnostic_bit_offset = @intCast(reader.bits_read);
+        diagnostic_bit_offset = @intCast(reader.bitsRead());
         const qscale_value = reader.readBits(11) orelse return .macroblock_header;
         _ = reader.readBits(1) orelse return .macroblock_header;
 
         const qscale: i32 = @intCast(qscale_value);
         if (qscale != last_qscale) {
-            for (0..64) |index| {
-                luma_scale[index] = qscale * @as(i32, luma_weight[index]);
-                chroma_scale[index] = qscale * @as(i32, chroma_weight[index]);
-            }
+            luma_quantiser.fill(qscale, &luma_weight, level_bias);
+            chroma_quantiser.fill(qscale, &chroma_weight, level_bias);
             last_qscale = qscale;
         }
 
         for (0..blocks_per_macroblock) |block_index| {
             diagnostic_stage = 3;
             diagnostic_block = @intCast(block_index);
-            diagnostic_bit_offset = @intCast(reader.bits_read);
+            diagnostic_bit_offset = @intCast(reader.bitsRead());
             var has_ac = false;
             const result = decodeBlock(
                 &reader,
                 macroblock * blocks_per_macroblock + block_index,
                 block_index,
                 &last_dc,
-                &luma_scale,
-                &chroma_scale,
+                &luma_quantiser,
+                &chroma_quantiser,
                 ac_info_length,
                 run_values_length,
                 eob_index,
@@ -516,14 +678,14 @@ fn decodeRowBytes(
                 &has_ac,
             );
             if (result != .ok) {
-                diagnostic_bit_offset = @intCast(reader.bits_read);
+                diagnostic_bit_offset = @intCast(reader.bitsRead());
                 return result;
             }
         }
     }
 
     diagnostic_stage = 4;
-    diagnostic_bit_offset = @intCast(reader.bits_read);
+    diagnostic_bit_offset = @intCast(reader.bitsRead());
     inverseDctBlocks(coefficients[0..].ptr, samples[0..].ptr, block_count, bit_depth);
     diagnostic_stage = 5;
     return .ok;
@@ -545,8 +707,8 @@ pub inline fn decodeBlockInto(
     out: *[64]i32,
     block_index: usize,
     last_dc: *[3]i32,
-    luma_scale: *const [64]i32,
-    chroma_scale: *const [64]i32,
+    luma_quantiser: *const Quantiser,
+    chroma_quantiser: *const Quantiser,
     is_444: bool,
     dc_shift: u32,
     has_ac: *bool,
@@ -557,56 +719,179 @@ pub inline fn decodeBlockInto(
         1 + (block_index & 1)
     else
         0;
-    const scale = if (component == 0) luma_scale else chroma_scale;
-    const weight = if (component == 0) tables.luma_weight else tables.chroma_weight;
-    const dc_len = reader.readSymbol(tables.dc_lookup) orelse return .dc_vlc;
-    if (dc_len > 31) return .dc_vlc;
+    const quantiser = if (component == 0) luma_quantiser else chroma_quantiser;
+    // One coefficient reads at most its AC symbol, sign, level index and run
+    // symbol. With that many bits cached none of them needs a check.
+    const coefficient_bits: usize = 16 + 1 + @as(usize, tables.index_bits) + 16;
+    const can_batch = tables.batch_reads and tables.index_bits >= 1 and coefficient_bits <= 56;
+    const fast = if (can_batch) tables.fast else null;
 
-    if (dc_len > 0) {
-        const delta_bits = reader.readBits(dc_len) orelse return .dc_delta;
-        const positive_threshold: u32 = @as(u32, 1) << @intCast(dc_len - 1);
-        const delta: i32 = if (delta_bits < positive_threshold)
-            @as(i32, @intCast(delta_bits)) - @as(i32, @intCast((@as(u32, 1) << @intCast(dc_len)) - 1))
-        else
-            @intCast(delta_bits);
-        last_dc[component] += delta * (@as(i32, 1) << @intCast(dc_shift));
+    dc: {
+        if (fast) |f| {
+            if (reader.canRefillWhole()) {
+                reader.refillWhole();
+                const entry = f.dc[@intCast(reader.cache >> (64 - FastTables.dc_bits))];
+                if (entry != 0) {
+                    reader.consume(entry & 0xff);
+                    // Branch-free: a clear top bit means a negative delta, and
+                    // a zero length reads nothing and adds nothing.
+                    const length: u6 = @intCast(entry >> 8);
+                    const bits: u32 = @truncate((reader.cache >> 1) >> (63 - length));
+                    reader.consume(length);
+                    const negative: u32 = ((bits << 1) >> @as(u5, @intCast(length))) -% 1;
+                    const span: u32 = (@as(u32, 1) << @as(u5, @intCast(length))) - 1;
+                    const delta: i32 = @bitCast(bits -% (negative & span));
+                    last_dc[component] += delta * (@as(i32, 1) << @intCast(dc_shift));
+                    break :dc;
+                }
+            }
+        }
+        const dc_len = reader.readSymbol(tables.dc_lookup) orelse return .dc_vlc;
+        if (dc_len > 31) return .dc_vlc;
+
+        if (dc_len > 0) {
+            const delta_bits = reader.readBits(dc_len) orelse return .dc_delta;
+            const positive_threshold: u32 = @as(u32, 1) << @intCast(dc_len - 1);
+            const delta: i32 = if (delta_bits < positive_threshold)
+                @as(i32, @intCast(delta_bits)) - @as(i32, @intCast((@as(u32, 1) << @intCast(dc_len)) - 1))
+            else
+                @intCast(delta_bits);
+            last_dc[component] += delta * (@as(i32, 1) << @intCast(dc_shift));
+        }
     }
 
     out[0] = last_dc[component];
     var coefficient_index: usize = 0;
     const eob_index = tables.eob_index;
-    var ac_index = reader.readSymbol(tables.ac_lookup) orelse return .ac_vlc;
-    has_ac.* = ac_index != eob_index;
+    const level_shift: u5 = @intCast(tables.level_shift);
 
-    while (ac_index != eob_index) {
+    while (true) {
+        if (fast) |f| {
+            // Everything the loop uses lives in locals: writes through `out`
+            // could otherwise alias the reader and the tables, and every
+            // field would go back through memory for each coefficient.
+            const ac_table = &f.ac;
+            const run_table = &f.run;
+            const scales = &quantiser.scale;
+            const offsets = &quantiser.offset;
+            const index_bits: u64 = tables.index_bits;
+            const bytes = reader.bytes.ptr;
+            const byte_count = reader.bytes.len;
+            var cache = reader.cache;
+            var cached = reader.cached_bits;
+            var offset = reader.byte_offset;
+            while (byte_count - offset >= 8) {
+                cache |= std.mem.readInt(u64, bytes[offset..][0..8], .big) >> @intCast(cached);
+                offset += (63 - cached) >> 3;
+                cached |= 56;
+
+                const entry = ac_table[@intCast(cache >> (64 - FastTables.ac_bits))];
+                if (entry == 0) break;
+                const entry_bits: u6 = @intCast(entry & FastTables.ac_length_mask);
+                cache <<= entry_bits;
+                cached -= entry_bits;
+
+                var level: u32 = entry >> FastTables.ac_level_shift;
+                var sign: u32 = (entry >> FastTables.ac_sign_shift) & 1;
+                if (entry & (FastTables.ac_end_of_block | FastTables.ac_partial) == 0) {
+                    coefficient_index += (entry >> FastTables.ac_run_shift) & FastTables.ac_run_mask;
+                } else {
+                    if (entry & FastTables.ac_end_of_block != 0) {
+                        reader.cache = cache;
+                        reader.cached_bits = cached;
+                        reader.byte_offset = offset;
+                        has_ac.* = coefficient_index != 0;
+                        return .ok;
+                    }
+
+                    sign = @intCast(cache >> 63);
+                    const has_index: u64 = (entry >> FastTables.ac_has_index_shift) & 1;
+                    const extra_bits: u6 = @intCast((0 -% has_index) & index_bits);
+                    const extra: u32 = @truncate((cache << 1 >> 1) >> (63 - extra_bits));
+                    const after_level = cache << 1 << extra_bits;
+                    level += extra << 7;
+
+                    const has_run: u32 = (entry >> FastTables.ac_has_run_shift) & 1;
+                    const run_mask: u32 = 0 -% has_run;
+                    const run_entry: u32 = run_table[@intCast(after_level >> (64 - FastTables.run_bits))];
+                    const level_bits = 1 + @as(usize, extra_bits);
+                    if (run_entry == 0 and has_run != 0) {
+                        reader.cache = after_level;
+                        reader.cached_bits = cached - level_bits;
+                        reader.byte_offset = offset;
+                        const run_symbol = reader.takeSymbol(tables.run_lookup) orelse return .run_vlc;
+                        if (run_symbol >= tables.run_values.len) return .run_vlc;
+                        coefficient_index += tables.run_values[run_symbol];
+                        cache = reader.cache;
+                        cached = reader.cached_bits;
+                    } else {
+                        const run_bits: u6 = @intCast(run_entry & run_mask & 0xff);
+                        cache = after_level << run_bits;
+                        cached -= level_bits + run_bits;
+                        coefficient_index += (run_entry >> 8) & run_mask;
+                    }
+                }
+
+                coefficient_index += 1;
+                if (coefficient_index > 63) {
+                    reader.cache = cache;
+                    reader.cached_bits = cached;
+                    reader.byte_offset = offset;
+                    return .coefficient_overrun;
+                }
+                const scaled: i32 = @as(i32, @intCast(level)) * scales[coefficient_index] + offsets[coefficient_index];
+                const value = scaled >> level_shift;
+                const negate: i32 = -@as(i32, @intCast(sign));
+                out[zigzag[coefficient_index]] = (value ^ negate) - negate;
+            }
+            reader.cache = cache;
+            reader.cached_bits = cached;
+            reader.byte_offset = offset;
+        }
+
+        // Long codes, bad codes and the end of the row, read with every check.
+        const ac_index = reader.readSymbol(tables.ac_lookup) orelse return .ac_vlc;
+        if (ac_index == eob_index) {
+            has_ac.* = coefficient_index != 0;
+            return .ok;
+        }
         const info_index = ac_index * 2;
         if (info_index + 1 >= tables.ac_info.len) return .ac_vlc;
         const level_base: u32 = tables.ac_info[info_index];
         const flags: u16 = tables.ac_info[info_index + 1];
-        const sign_bit = reader.readBits(1) orelse return .ac_sign;
         var level = level_base;
+        var sign_bit: u32 = undefined;
+        const batched = can_batch and reader.ensure(coefficient_bits);
 
-        if ((flags & 1) != 0) {
-            const extra = reader.readBits(tables.index_bits) orelse return .ac_level;
-            level += extra << 7;
-        }
-        if ((flags & 2) != 0) {
-            const run_symbol = reader.readSymbol(tables.run_lookup) orelse return .run_vlc;
-            if (run_symbol >= tables.run_values.len) return .run_vlc;
-            coefficient_index += tables.run_values[run_symbol];
+        if (batched) {
+            sign_bit = reader.takeBits(1);
+            if ((flags & 1) != 0) level += reader.takeBits(tables.index_bits) << 7;
+            if ((flags & 2) != 0) {
+                const run_symbol = reader.takeSymbol(tables.run_lookup) orelse return .run_vlc;
+                if (run_symbol >= tables.run_values.len) return .run_vlc;
+                coefficient_index += tables.run_values[run_symbol];
+            }
+        } else {
+            sign_bit = reader.readBits(1) orelse return .ac_sign;
+            if ((flags & 1) != 0) {
+                const extra = reader.readBits(tables.index_bits) orelse return .ac_level;
+                level += extra << 7;
+            }
+            if ((flags & 2) != 0) {
+                const run_symbol = reader.readSymbol(tables.run_lookup) orelse return .run_vlc;
+                if (run_symbol >= tables.run_values.len) return .run_vlc;
+                coefficient_index += tables.run_values[run_symbol];
+            }
         }
 
         coefficient_index += 1;
         if (coefficient_index > 63) return .coefficient_overrun;
         const natural_index = zigzag[coefficient_index];
-        var value: i32 = @as(i32, @intCast(level)) * scale[coefficient_index];
-        value += scale[coefficient_index] >> 1;
-        if (tables.level_bias < 32 or weight[coefficient_index] != tables.level_bias) value += tables.level_bias;
-        value >>= @intCast(tables.level_shift);
+        var value: i32 = @as(i32, @intCast(level)) * quantiser.scale[coefficient_index];
+        value += quantiser.offset[coefficient_index];
+        value >>= level_shift;
         out[natural_index] = if (sign_bit != 0) -value else value;
-        ac_index = reader.readSymbol(tables.ac_lookup) orelse return .ac_vlc;
     }
-    return .ok;
 }
 
 inline fn decodeBlock(
@@ -614,8 +899,8 @@ inline fn decodeBlock(
     block: usize,
     block_index: usize,
     last_dc: *[3]i32,
-    luma_scale: *const [64]i32,
-    chroma_scale: *const [64]i32,
+    luma_quantiser: *const Quantiser,
+    chroma_quantiser: *const Quantiser,
     ac_info_length: u32,
     run_values_length: u32,
     eob_index: u32,
@@ -627,7 +912,7 @@ inline fn decodeBlock(
     has_ac: *bool,
 ) DecodeError {
     const tables = globalTables(ac_info_length, run_values_length, eob_index, index_bits, level_bias, level_shift);
-    return decodeBlockInto(&tables, reader, coefficients[block * 64 ..][0..64], block_index, last_dc, luma_scale, chroma_scale, is_444, dc_shift, has_ac);
+    return decodeBlockInto(&tables, reader, coefficients[block * 64 ..][0..64], block_index, last_dc, luma_quantiser, chroma_quantiser, is_444, dc_shift, has_ac);
 }
 
 fn inverseDctBlocks(output_coefficients: [*]const i32, output_samples: [*]u16, block_count: usize, bit_depth: u32) void {

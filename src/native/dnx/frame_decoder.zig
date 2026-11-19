@@ -2,10 +2,13 @@
 //! and can decode at 1/2, 1/4 or 1/8 of the frame's size.
 //!
 //! Unlike `decode.zig` (which drives the WASM row decoder's module globals
-//! one frame at a time behind a mutex), every buffer here belongs to the call,
-//! so any number of frames may decode at once, and one frame's macroblock rows
-//! are split across threads (each DNx row restarts its DC prediction, so rows
-//! are independent).
+//! one frame at a time behind a mutex), every buffer a decode writes belongs
+//! to it, so any number of frames may decode at once. Each DNx row restarts
+//! its DC prediction, so rows are independent: the caller and the shared
+//! workers (`worker_pool.zig`) take one row at a time, which keeps fast and
+//! slow cores busy alike. RGB and biplanar output go straight from a small
+//! per-thread row buffer to the target; only planar output holds a whole frame
+//! of u16 samples.
 //!
 //! Reduced decoding: each 8x8 block is reconstructed with an n-point inverse
 //! DCT (n = 8 >> log2_downscale) of its lowest n x n frequencies, scaled by
@@ -13,12 +16,14 @@
 //! end-of-block symbol, so the bitstream is still parsed in full; the saving
 //! is the inverse transform and everything per pixel after it.
 
+const builtin = @import("builtin");
 const std = @import("std");
+const decode_mod = @import("decode.zig");
 const header_mod = @import("header.zig");
 const huffman = @import("huffman.zig");
-const decode_mod = @import("decode.zig");
-const row = @import("../dnx_row_decoder.zig");
+const worker_pool = @import("worker_pool.zig");
 const fast_idct = @import("../dnx_fast_idct.zig");
+const row = @import("../dnx_row_decoder.zig");
 
 pub const RgbFrame = decode_mod.RgbFrame;
 
@@ -33,10 +38,17 @@ pub const Error = error{
     TargetTooSmall,
 } || std.mem.Allocator.Error || std.Thread.SpawnError;
 
+/// Below this much work per thread, waking another costs more than it saves.
+pub const rows_per_default_thread = 4;
+/// More threads than this stopped helping even at 2160p.
+pub const max_default_threads = 16;
+
 pub const Options = struct {
     /// 0 full size, 1 half, 2 quarter, 3 eighth.
     log2_downscale: u2 = 0,
-    /// Threads to decode one frame with; 0 picks the CPU count.
+    /// Threads to decode one frame with; 0 picks one per
+    /// `rows_per_default_thread` macroblock rows, up to the CPU count and
+    /// `max_default_threads`.
     concurrency: u32 = 0,
 };
 
@@ -76,21 +88,32 @@ pub const YuvFrame = struct {
 /// reduced decode of a frame with per-macroblock field coding (MBAFF) is
 /// refused rather than approximated.
 pub fn decodeYuv16(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!YuvFrame {
-    var job = try Job.init(allocator, packet, options);
-    defer job.deinit();
-    try job.run(.planar);
-    return job.takeYuv();
+    var job = try Job.init(packet, options);
+    const samples = @as(usize, job.plane_width) * job.plane_height + 2 * @as(usize, job.chroma_width) * job.plane_height;
+    const data = try allocator.alloc(u16, samples);
+    errdefer allocator.free(data);
+    try job.run(.{ .planar = data });
+    return .{
+        .data = data,
+        .width = job.width,
+        .height = job.height,
+        .plane_width = job.plane_width,
+        .chroma_width = job.chroma_width,
+        .plane_height = job.plane_height,
+        .bit_depth = job.hdr.bit_depth,
+        .is_444 = job.hdr.is_444,
+        .allocator = allocator,
+    };
 }
 
 /// Decodes `packet` to interleaved RGB8 (BT.709 limited range to full range),
 /// byte-for-byte what `decode.decodeFrameRgb8` returns at full size.
 pub fn decodeRgb8(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!RgbFrame {
-    var job = try Job.init(allocator, packet, options);
-    defer job.deinit();
+    var job = try Job.init(packet, options);
     const stride: usize = @as(usize, job.width) * 3;
     const rgb = try allocator.alloc(u8, stride * job.height);
     errdefer allocator.free(rgb);
-    try job.run(.{ .rgb8 = rgb });
+    try job.run(.{ .rgb8 = .{ .data = rgb, .stride_bytes = stride } });
     return .{ .data = rgb, .width = job.width, .height = job.height, .stride_bytes = stride, .allocator = allocator };
 }
 
@@ -117,20 +140,33 @@ pub const Biplanar = struct {
     }
 };
 
+/// Interleaved RGB8 rows at a stride; bytes past a row's pixels are left alone.
+const Rgb8Target = struct {
+    data: []u8,
+    stride_bytes: usize,
+
+    fn fits(self: Rgb8Target, width: u32, height: u32) bool {
+        if (width == 0 or height == 0) return true;
+        const row_bytes = @as(usize, width) * 3;
+        if (self.stride_bytes < row_bytes) return false;
+        return self.data.len >= (@as(usize, height) - 1) * self.stride_bytes + row_bytes;
+    }
+};
+
 /// One frame's decode in two steps, so a caller can size (or borrow) its
 /// planes from the frame's header first: `init` parses the header and knows
-/// the output size; `decodeBiplanar` decodes on every thread, each thread
-/// writing its own rows straight into the planes, so there is no pass over
-/// the whole frame after the decode.
+/// the output size; a decode then runs on every thread, each thread writing
+/// its own rows straight into the target, with no pass over the whole frame
+/// after it.
 pub const Prepared = struct {
     job: Job,
 
     pub fn init(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!Prepared {
-        return .{ .job = try Job.init(allocator, packet, options) };
+        _ = allocator;
+        return .{ .job = try Job.init(packet, options) };
     }
 
     pub fn deinit(self: *Prepared) void {
-        self.job.deinit();
         self.* = undefined;
     }
 
@@ -154,55 +190,127 @@ pub const Prepared = struct {
         if (!target.fits(self.job.width, self.job.height, self.job.hdr.is_444)) return error.TargetTooSmall;
         try self.job.run(.{ .biplanar = target });
     }
+
+    /// Decodes to interleaved RGB8 in `target`, as `decodeRgb8` does, so a
+    /// host can reuse its frame memory; `TargetTooSmall` (nothing written)
+    /// when it cannot hold `width` x `height`. Call once.
+    pub fn decodeRgb8Into(self: *Prepared, target: []u8, stride_bytes: usize) Error!void {
+        const rgb: Rgb8Target = .{ .data = target, .stride_bytes = stride_bytes };
+        if (!rgb.fits(self.job.width, self.job.height)) return error.TargetTooSmall;
+        try self.job.run(.{ .rgb8 = rgb });
+    }
 };
 
-/// What each band writes once its macroblock rows are decoded.
+/// The C kernels in `dnx_idct_kernel.c`, on x86-64 CPUs with AVX2.
+const simd = struct {
+    const compiled = builtin.cpu.arch == .x86_64;
+
+    extern fn dnx_x86_has_avx2() c_int;
+    extern fn dnx_idct8_avx2(coefficients: [*]const i32, output: [*]u16, scale: [*]const f32, factors: [*]const f32, maximum: u32) void;
+    extern fn dnx_rgb8_line_avx2(luma: [*]const u16, cb: [*]const u16, cr: [*]const u16, out: [*]u8, width: usize, shift: u32, is_444: c_int) usize;
+    extern fn dnx_shift_line_avx2(samples: [*]const u16, out: [*]u8, count: usize, shift: u32) usize;
+    extern fn dnx_interleave_line_avx2(cb: [*]const u16, cr: [*]const u16, out: [*]u8, pairs: usize, shift: u32) usize;
+
+    const unknown = 0;
+    const absent = 1;
+    const present = 2;
+    var detected: std.atomic.Value(u8) = .init(unknown);
+    /// Tests clear this to exercise the portable paths on any machine.
+    var enabled = true;
+
+    fn available() bool {
+        if (!compiled or !enabled) return false;
+        var state = detected.load(.monotonic);
+        if (state == unknown) {
+            state = if (dnx_x86_has_avx2() != 0) present else absent;
+            detected.store(state, .monotonic);
+        }
+        return state == present;
+    }
+
+    inline fn idct8(coefficients: *const [64]i32, samples: *[64]u16, maximum: u16) void {
+        dnx_idct8_avx2(coefficients, samples, &fast_idct.scale_matrix, &fast_idct.idct_factors, maximum);
+    }
+
+    inline fn rgb8Line(luma: [*]const u16, cb: [*]const u16, cr: [*]const u16, out: [*]u8, width: usize, shift: u4, is_444: bool) usize {
+        return dnx_rgb8_line_avx2(luma, cb, cr, out, width, shift, @intFromBool(is_444));
+    }
+
+    inline fn shiftLine(samples: []const u16, out: []u8, shift: u4) usize {
+        return dnx_shift_line_avx2(samples.ptr, out.ptr, samples.len, shift);
+    }
+
+    inline fn interleaveLine(cb: []const u16, cr: []const u16, out: []u8, shift: u4) usize {
+        return dnx_interleave_line_avx2(cb.ptr, cr.ptr, out.ptr, cb.len, shift);
+    }
+};
+
+/// Where each decoded macroblock row goes.
 const Output = union(enum) {
-    planar,
-    rgb8: []u8,
+    planar: []u16,
+    rgb8: Rgb8Target,
     biplanar: Biplanar,
 };
 
+/// One macroblock row's planes: into the planar frame, or a row buffer.
+const RowPlanes = struct {
+    luma: [*]u16,
+    cb: [*]u16,
+    cr: [*]u16,
+    luma_stride: usize,
+    chroma_stride: usize,
+};
+
+const failure_decode = 1;
+const failure_memory = 2;
+
 const Job = struct {
-    allocator: std.mem.Allocator,
     packet: []const u8,
     hdr: header_mod.FrameHeader,
-    tables: *huffman.TableSet,
     row_tables: row.Tables,
     spans: [256]header_mod.RowSpan,
     span_count: usize,
     log2: u2,
     concurrency: u32,
-    yuv: []u16,
-    yuv_taken: bool = false,
     width: u32,
     height: u32,
     plane_width: u32,
     chroma_width: u32,
     plane_height: u32,
-    failed: std.atomic.Value(u32) = .init(0),
+    output: Output = undefined,
+    use_avx2: bool = false,
+    task: worker_pool.Task = undefined,
+    next_row: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    failed: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
 
-    fn init(allocator: std.mem.Allocator, packet: []const u8, options: Options) Error!Job {
+    fn init(packet: []const u8, options: Options) Error!Job {
         const hdr = header_mod.parseFrameHeader(packet) orelse return error.InvalidDnxHeader;
         if (!hdr.supported) return error.UnsupportedDnxProfile;
         if (hdr.interlaced) return error.InterlacedNotSupported;
         if (hdr.mbaff and options.log2_downscale != 0) return error.UnsupportedDownscale;
-
-        const tables = try allocator.create(huffman.TableSet);
-        errdefer allocator.destroy(tables);
-        tables.* = huffman.tableForCid(hdr.cid) orelse return error.UnsupportedDnxCid;
+        const t = huffman.sharedTableForCid(hdr.cid) orelse return error.UnsupportedDnxCid;
 
         var job: Job = .{
-            .allocator = allocator,
             .packet = packet,
             .hdr = hdr,
-            .tables = tables,
-            .row_tables = undefined,
+            .row_tables = .{
+                .dc_lookup = &t.dc_lookup,
+                .ac_lookup = &t.ac_lookup,
+                .run_lookup = &t.run_lookup,
+                .ac_info = t.ac_info,
+                .run_values = t.run,
+                .luma_weight = t.luma_weight[0..64],
+                .chroma_weight = t.chroma_weight[0..64],
+                .eob_index = t.eob_index,
+                .index_bits = t.index_bits,
+                .level_bias = t.level_bias,
+                .level_shift = t.level_shift,
+                .fast = &t.fast,
+            },
             .spans = undefined,
             .span_count = 0,
             .log2 = options.log2_downscale,
             .concurrency = options.concurrency,
-            .yuv = &.{},
             .width = 0,
             .height = 0,
             .plane_width = 0,
@@ -225,86 +333,110 @@ const Job = struct {
         const divisor = @as(u32, 1) << k;
         job.width = (hdr.width + divisor - 1) >> k;
         job.height = (hdr.height + divisor - 1) >> k;
-        const samples = @as(usize, job.plane_width) * job.plane_height + 2 * @as(usize, job.chroma_width) * job.plane_height;
-        job.yuv = try allocator.alloc(u16, samples);
         return job;
     }
 
-    fn deinit(self: *Job) void {
-        if (!self.yuv_taken) self.allocator.free(self.yuv);
-        self.allocator.destroy(self.tables);
-    }
-
-    fn takeYuv(self: *Job) YuvFrame {
-        self.yuv_taken = true;
-        return .{
-            .data = self.yuv,
-            .width = self.width,
-            .height = self.height,
-            .plane_width = self.plane_width,
-            .chroma_width = self.chroma_width,
-            .plane_height = self.plane_height,
-            .bit_depth = self.hdr.bit_depth,
-            .is_444 = self.hdr.is_444,
-            .allocator = self.allocator,
-        };
-    }
-
     fn run(self: *Job, output: Output) Error!void {
-        const t = self.tables;
-        self.row_tables = .{
-            .dc_lookup = &t.dc_lookup,
-            .ac_lookup = &t.ac_lookup,
-            .run_lookup = &t.run_lookup,
-            .ac_info = t.ac_info,
-            .run_values = t.run,
-            .luma_weight = t.luma_weight[0..64],
-            .chroma_weight = t.chroma_weight[0..64],
-            .eob_index = t.eob_index,
-            .index_bits = t.index_bits,
-            .level_bias = t.level_bias,
-            .level_shift = t.level_shift,
-        };
+        self.output = output;
+        self.use_avx2 = simd.available();
+        self.next_row.store(0, .monotonic);
+        self.failed.store(0, .monotonic);
         const rows: u32 = self.hdr.macroblock_height;
         var threads: u32 = self.concurrency;
-        if (threads == 0) threads = @intCast(std.Thread.getCpuCount() catch 1);
-        threads = @max(1, @min(threads, rows));
-
-        var handles: [64]std.Thread = undefined;
-        threads = @min(threads, handles.len + 1);
-        var spawned: usize = 0;
-        defer for (handles[0..spawned]) |h| h.join();
-        var band: u32 = 1;
-        while (band < threads) : (band += 1) {
-            handles[spawned] = try std.Thread.spawn(.{}, bandWorker, .{ self, output, band, threads });
-            spawned += 1;
+        if (threads == 0) {
+            const cores: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+            threads = @min(cores, max_default_threads, rows / rows_per_default_thread);
         }
-        bandWorker(self, output, 0, threads);
-        for (handles[0..spawned]) |h| h.join();
-        spawned = 0;
-        if (self.failed.load(.acquire) != 0) return error.DnxDecodeFailed;
+        threads = @max(1, @min(threads, rows));
+        if (threads == 1) {
+            self.work();
+        } else {
+            self.task = .{ .run_fn = taskMain };
+            worker_pool.run(&self.task, threads - 1);
+        }
+        return switch (self.failed.load(.acquire)) {
+            0 => {},
+            failure_memory => error.OutOfMemory,
+            else => error.DnxDecodeFailed,
+        };
     }
 
-    fn bandWorker(self: *Job, output: Output, band: u32, bands: u32) void {
+    fn taskMain(task: *worker_pool.Task) void {
+        const self: *Job = @alignCast(@fieldParentPtr("task", task));
+        self.work();
+    }
+
+    fn work(self: *Job) void {
+        switch (self.log2) {
+            inline 0, 1, 2, 3 => |k| if (self.hdr.is_444) self.workAs(k, true) else self.workAs(k, false),
+        }
+    }
+
+    /// Takes rows until none are left, or another thread has failed.
+    fn workAs(self: *Job, comptime k: u2, comptime is_444: bool) void {
+        const rows_per_mb: usize = @as(usize, 16) >> k;
+        const plane_width: usize = self.plane_width;
+        const chroma_width: usize = self.chroma_width;
         const rows: u32 = self.hdr.macroblock_height;
-        const first = rows * band / bands;
-        const last = rows * (band + 1) / bands;
-        var r = first;
-        while (r < last) : (r += 1) {
-            if (self.failed.load(.monotonic) != 0) return;
-            if (self.decodeRow(r) != .ok) {
-                self.failed.store(1, .release);
+
+        var buffer: ?worker_pool.Buffer = null;
+        defer if (buffer) |held| worker_pool.releaseBuffer(held);
+        var buffered: RowPlanes = undefined;
+        if (self.output != .planar) {
+            const samples = (plane_width + 2 * chroma_width) * rows_per_mb;
+            const held = worker_pool.acquireBuffer(samples * @sizeOf(u16)) catch {
+                self.failed.store(failure_memory, .release);
+                return;
+            };
+            buffer = held;
+            const base: [*]u16 = @ptrCast(held.ptr);
+            buffered = .{
+                .luma = base,
+                .cb = base + plane_width * rows_per_mb,
+                .cr = base + (plane_width + chroma_width) * rows_per_mb,
+                .luma_stride = plane_width,
+                .chroma_stride = chroma_width,
+            };
+        }
+
+        while (self.failed.load(.monotonic) == 0) {
+            const r = self.next_row.fetchAdd(1, .monotonic);
+            if (r >= rows) return;
+            const y = @as(usize, r) * rows_per_mb;
+            const planes = switch (self.output) {
+                .planar => |data| self.frameRow(data, y),
+                else => buffered,
+            };
+            if (self.decodeRow(k, is_444, r, planes) != .ok) {
+                self.failed.store(failure_decode, .release);
                 return;
             }
-        }
-        switch (output) {
-            .planar => {},
-            .rgb8 => |out| self.convertRows(out, first, last),
-            .biplanar => |out| self.packRows(out, first, last),
+            if (y >= self.height) continue;
+            const lines = @min(rows_per_mb, self.height - y);
+            switch (self.output) {
+                .planar => {},
+                .rgb8 => |target| self.convertLines(is_444, target, planes, y, lines),
+                .biplanar => |target| self.packLines(is_444, target, planes, y, lines),
+            }
         }
     }
 
-    fn decodeRow(self: *Job, r: u32) row.DecodeError {
+    fn frameRow(self: *const Job, data: []u16, y: usize) RowPlanes {
+        const plane_width: usize = self.plane_width;
+        const chroma_width: usize = self.chroma_width;
+        const luma_size = plane_width * self.plane_height;
+        const chroma_size = chroma_width * self.plane_height;
+        return .{
+            .luma = data.ptr + y * plane_width,
+            .cb = data.ptr + luma_size + y * chroma_width,
+            .cr = data.ptr + luma_size + chroma_size + y * chroma_width,
+            .luma_stride = plane_width,
+            .chroma_stride = chroma_width,
+        };
+    }
+
+    fn decodeRow(self: *const Job, comptime k: u2, comptime is_444: bool, r: u32, planes: RowPlanes) row.DecodeError {
+        const n: usize = @as(usize, 8) >> k;
         const span = self.spans[r];
         if (span.start > span.end or span.end > self.packet.len) return .invalid_arguments;
         var reader = row.BitReader{ .bytes = self.packet[span.start..span.end] };
@@ -315,15 +447,15 @@ const Job = struct {
             @as(i32, 1) << @intCast(bit_depth + 2),
         };
         var last_qscale: i32 = -1;
-        var luma_scale: [64]i32 = undefined;
-        var chroma_scale: [64]i32 = undefined;
+        var luma_quantiser: row.Quantiser = undefined;
+        var chroma_quantiser: row.Quantiser = undefined;
         const maximum: u16 = @intCast((@as(u32, 1) << @intCast(bit_depth)) - 1);
         const dc_shift: u32 = if (bit_depth == 12) 2 else 0;
         const mbaff = self.hdr.mbaff;
-        const is_444 = self.hdr.is_444;
         const blocks_per_macroblock: usize = if (is_444) 12 else 8;
-        var coefficients: [64]i32 align(16) = undefined;
-        var samples: [64]u16 align(16) = undefined;
+        var coefficients: [64]i32 align(32) = undefined;
+        var coefficients_dirty = true;
+        var samples: [64]u16 align(32) = undefined;
 
         var macroblock: usize = 0;
         while (macroblock < self.hdr.macroblock_width) : (macroblock += 1) {
@@ -335,184 +467,155 @@ const Job = struct {
             _ = reader.readBits(1) orelse return .macroblock_header;
             const qscale: i32 = @intCast(qscale_value);
             if (qscale != last_qscale) {
-                for (0..64) |index| {
-                    luma_scale[index] = qscale * @as(i32, self.row_tables.luma_weight[index]);
-                    chroma_scale[index] = qscale * @as(i32, self.row_tables.chroma_weight[index]);
-                }
+                luma_quantiser.fill(qscale, self.row_tables.luma_weight, self.row_tables.level_bias);
+                chroma_quantiser.fill(qscale, self.row_tables.chroma_weight, self.row_tables.level_bias);
                 last_qscale = qscale;
             }
             for (0..blocks_per_macroblock) |block_index| {
-                @memset(&coefficients, 0);
+                // A block with no AC wrote only its DC, which the next overwrites.
+                if (coefficients_dirty) @memset(&coefficients, 0);
                 var has_ac = false;
-                const result = row.decodeBlockInto(&self.row_tables, &reader, &coefficients, block_index, &last_dc, &luma_scale, &chroma_scale, is_444, dc_shift, &has_ac);
+                const result = row.decodeBlockInto(&self.row_tables, &reader, &coefficients, block_index, &last_dc, &luma_quantiser, &chroma_quantiser, is_444, dc_shift, &has_ac);
                 if (result != .ok) return result;
-                const n: usize = @as(usize, 8) >> self.log2;
-                if (self.log2 == 0) {
+                coefficients_dirty = has_ac;
+                if (k == 0) {
                     if (has_ac) {
-                        fast_idct.transformBlock(&coefficients, &samples, maximum);
+                        if (simd.compiled and self.use_avx2) {
+                            simd.idct8(&coefficients, &samples, maximum);
+                        } else {
+                            fast_idct.transformBlock(&coefficients, &samples, maximum);
+                        }
                     } else {
                         fast_idct.transformDcBlock(coefficients[0], &samples, maximum);
                     }
-                } else switch (self.log2) {
-                    1 => reducedIdct(4, &coefficients, &samples, maximum),
-                    2 => reducedIdct(2, &coefficients, &samples, maximum),
-                    else => reducedIdct(1, &coefficients, &samples, maximum),
+                } else if (has_ac) {
+                    reducedIdct(n, &coefficients, &samples, maximum);
+                } else {
+                    reducedDc(n, coefficients[0], &samples, maximum);
                 }
-                self.storeBlock(&samples, n, r, macroblock, block_index, interlaced);
+                storeBlock(k, is_444, &samples, planes, macroblock, block_index, interlaced);
             }
         }
         return .ok;
     }
 
     /// Writes an n x n block of `samples` where block `block_index` of
-    /// macroblock (`r`, `macroblock`) lands, at the reduced size.
-    fn storeBlock(self: *Job, samples: *const [64]u16, n: usize, r: u32, macroblock: usize, block_index: usize, interlaced: bool) void {
-        const plane_width: usize = self.plane_width;
-        const chroma_width: usize = self.chroma_width;
-        const y_size = plane_width * self.plane_height;
-        const chroma_size = chroma_width * self.plane_height;
+    /// `macroblock` lands in its row's planes, at the reduced size.
+    inline fn storeBlock(comptime k: u2, comptime is_444: bool, samples: *const [64]u16, planes: RowPlanes, macroblock: usize, block_index: usize, interlaced: bool) void {
+        const n: usize = @as(usize, 8) >> k;
         // Positions in full-size samples, scaled by n / 8 at the end.
         const luma_x = macroblock * 16;
-        const chroma_x = macroblock * (if (self.hdr.is_444) @as(usize, 16) else 8);
-        const y = @as(usize, r) * 16;
-        const line_step: usize = if (interlaced) 2 else 1;
         const bottom_offset: usize = if (interlaced) 1 else 8;
-
-        var plane_start: usize = 0;
-        var stride: usize = plane_width;
-        var bx: usize = 0;
-        var by: usize = 0;
-        if (self.hdr.is_444) {
+        var target: [*]u16 = planes.luma;
+        var stride: usize = planes.luma_stride;
+        var bx: usize = undefined;
+        var by: usize = undefined;
+        if (is_444) {
             const plane = (block_index >> 1) % 3;
             const quadrant = block_index / 6 * 2 + block_index % 2;
-            plane_start = plane * y_size;
+            if (plane != 0) {
+                target = if (plane == 1) planes.cb else planes.cr;
+                stride = planes.chroma_stride;
+            }
             bx = luma_x + (quadrant % 2) * 8;
-            by = y + (quadrant / 2) * bottom_offset;
-        } else switch (block_index) {
-            0 => {
-                bx = luma_x;
-                by = y;
-            },
-            1 => {
-                bx = luma_x + 8;
-                by = y;
-            },
-            2, 3 => {
-                plane_start = if (block_index == 2) y_size else y_size + chroma_size;
-                stride = chroma_width;
-                bx = chroma_x;
-                by = y;
-            },
-            4 => {
-                bx = luma_x;
-                by = y + bottom_offset;
-            },
-            5 => {
-                bx = luma_x + 8;
-                by = y + bottom_offset;
-            },
-            6, 7 => {
-                plane_start = if (block_index == 6) y_size else y_size + chroma_size;
-                stride = chroma_width;
-                bx = chroma_x;
-                by = y + bottom_offset;
-            },
-            else => unreachable,
+            by = (quadrant / 2) * bottom_offset;
+        } else {
+            by = if (block_index >= 4) bottom_offset else 0;
+            if (block_index & 2 != 0) {
+                target = if (block_index & 1 == 0) planes.cb else planes.cr;
+                stride = planes.chroma_stride;
+                bx = macroblock * 8;
+            } else {
+                bx = luma_x + (block_index & 1) * 8;
+            }
         }
-        const k: u6 = self.log2;
         const x0 = bx >> k;
         const y0 = by >> k;
-        const step = if (self.log2 == 0) line_step else 1;
+        // Field-coded macroblocks only reach here at full size.
+        const step: usize = if (k == 0 and interlaced) 2 else 1;
         for (0..n) |block_row| {
-            const output_start = plane_start + (y0 + block_row * step) * stride + x0;
-            @memcpy(self.yuv[output_start..][0..n], samples[block_row * n ..][0..n]);
+            const line = target + (y0 + block_row * step) * stride + x0;
+            line[0..n].* = samples[block_row * n ..][0..n].*;
         }
     }
 
-    /// BT.709 limited range to full-range RGB8, the formula `decode.zig` uses,
-    /// for the pixel rows macroblock rows `first`..`last` produced.
-    fn convertRows(self: *Job, rgb: []u8, first: u32, last: u32) void {
-        const shift: u4 = switch (self.hdr.bit_depth) {
-            8 => 0,
-            10 => 2,
-            else => 4,
-        };
-        switch (shift) {
-            inline 0, 2, 4 => |s| if (self.hdr.is_444)
-                self.convertRowsAs(true, s, rgb, first, last)
-            else
-                self.convertRowsAs(false, s, rgb, first, last),
-            else => unreachable,
-        }
-    }
-
-    /// The pixel rows macroblock rows `first`..`last` produced, into the
-    /// host's biplanar planes with each sample moved to the u16's high bits.
-    fn packRows(self: *Job, target: Biplanar, first: u32, last: u32) void {
+    /// BT.709 limited range to full-range RGB8, the formula `decode.zig` uses.
+    fn convertLines(self: *const Job, comptime is_444: bool, target: Rgb8Target, planes: RowPlanes, y: usize, lines: usize) void {
         switch (self.hdr.bit_depth) {
-            inline 8, 10, 12 => |depth| if (self.hdr.is_444)
-                self.packRowsAs(true, 16 - depth, target, first, last)
-            else
-                self.packRowsAs(false, 16 - depth, target, first, last),
+            inline 8, 10, 12 => |depth| {
+                const shift: u4 = depth - 8;
+                for (0..lines) |line| {
+                    convertLine(
+                        is_444,
+                        shift,
+                        planes.luma + line * planes.luma_stride,
+                        planes.cb + line * planes.chroma_stride,
+                        planes.cr + line * planes.chroma_stride,
+                        target.data.ptr + (y + line) * target.stride_bytes,
+                        self.width,
+                        self.use_avx2,
+                    );
+                }
+            },
             else => unreachable,
         }
     }
 
-    fn packRowsAs(self: *Job, comptime is_444: bool, comptime shift: u4, target: Biplanar, first: u32, last: u32) void {
-        const rows_per_mb: u32 = @as(u32, 16) >> @as(u5, self.log2);
-        const y_begin = first * rows_per_mb;
-        const y_end = @min(last * rows_per_mb, self.height);
-        const plane_width: usize = self.plane_width;
-        const chroma_width: usize = self.chroma_width;
-        const y_plane = self.yuv[0 .. plane_width * self.plane_height];
-        const cb_plane = self.yuv[y_plane.len..][0 .. chroma_width * self.plane_height];
-        const cr_plane = self.yuv[y_plane.len + cb_plane.len ..][0 .. chroma_width * self.plane_height];
-        const width: usize = self.width;
-        const pairs: usize = if (is_444) width else (width + 1) / 2;
-        var y: usize = y_begin;
-        while (y < y_end) : (y += 1) {
-            const luma_in = y_plane[y * plane_width ..][0..width];
-            const luma_out = target.luma[y * target.luma_stride_bytes ..][0 .. width * 2];
-            for (luma_in, 0..) |sample, x| std.mem.writeInt(u16, luma_out[x * 2 ..][0..2], sample << shift, .little);
-            const cb_in = cb_plane[y * chroma_width ..][0..pairs];
-            const cr_in = cr_plane[y * chroma_width ..][0..pairs];
-            const chroma_out = target.chroma[y * target.chroma_stride_bytes ..][0 .. pairs * 4];
-            for (cb_in, cr_in, 0..) |cb, cr, x| {
-                std.mem.writeInt(u16, chroma_out[x * 4 ..][0..2], cb << shift, .little);
-                std.mem.writeInt(u16, chroma_out[x * 4 + 2 ..][0..2], cr << shift, .little);
-            }
-        }
-    }
-
-    fn convertRowsAs(self: *Job, comptime is_444: bool, comptime shift: u4, rgb: []u8, first: u32, last: u32) void {
-        const rows_per_mb: u32 = @as(u32, 16) >> @as(u5, self.log2);
-        const y_begin = first * rows_per_mb;
-        const y_end = @min(last * rows_per_mb, self.height);
-        const plane_width: usize = self.plane_width;
-        const chroma_width: usize = self.chroma_width;
-        const y_plane = self.yuv[0 .. plane_width * self.plane_height];
-        const cb_plane = self.yuv[y_plane.len..][0 .. chroma_width * self.plane_height];
-        const cr_plane = self.yuv[y_plane.len + cb_plane.len ..][0 .. chroma_width * self.plane_height];
-        const width: usize = self.width;
-        const stride: usize = width * 3;
-        var y: usize = y_begin;
-        while (y < y_end) : (y += 1) {
-            const luma_row = y_plane[y * plane_width ..][0..width];
-            const cb_row = cb_plane[y * chroma_width ..];
-            const cr_row = cr_plane[y * chroma_width ..];
-            const out = rgb[y * stride ..][0..stride];
-            for (luma_row, 0..) |sample, x| {
-                const cx: usize = if (is_444) x else x / 2;
-                const y_: i32 = @as(i32, sample >> shift) - 16;
-                const u_: i32 = @as(i32, cb_row[cx] >> shift) - 128;
-                const v_: i32 = @as(i32, cr_row[cx] >> shift) - 128;
-                out[x * 3] = @intCast(std.math.clamp((298 * y_ + 459 * v_ + 128) >> 8, 0, 255));
-                out[x * 3 + 1] = @intCast(std.math.clamp((298 * y_ - 55 * u_ - 136 * v_ + 128) >> 8, 0, 255));
-                out[x * 3 + 2] = @intCast(std.math.clamp((298 * y_ + 541 * u_ + 128) >> 8, 0, 255));
-            }
+    /// The rows' samples, into the host's biplanar planes with each sample
+    /// moved to the u16's high bits.
+    fn packLines(self: *const Job, comptime is_444: bool, target: Biplanar, planes: RowPlanes, y: usize, lines: usize) void {
+        switch (self.hdr.bit_depth) {
+            inline 8, 10, 12 => |depth| {
+                const shift: u4 = 16 - depth;
+                const width: usize = self.width;
+                const pairs: usize = if (is_444) width else (width + 1) / 2;
+                for (0..lines) |line| {
+                    const luma_in = (planes.luma + line * planes.luma_stride)[0..width];
+                    const luma_out = target.luma[(y + line) * target.luma_stride_bytes ..][0 .. width * 2];
+                    const luma_done: usize = if (simd.compiled and self.use_avx2) simd.shiftLine(luma_in, luma_out, shift) else 0;
+                    for (luma_in[luma_done..], luma_done..) |sample, x| std.mem.writeInt(u16, luma_out[x * 2 ..][0..2], sample << shift, .little);
+                    const cb_in = (planes.cb + line * planes.chroma_stride)[0..pairs];
+                    const cr_in = (planes.cr + line * planes.chroma_stride)[0..pairs];
+                    const chroma_out = target.chroma[(y + line) * target.chroma_stride_bytes ..][0 .. pairs * 4];
+                    const pairs_done: usize = if (simd.compiled and self.use_avx2) simd.interleaveLine(cb_in, cr_in, chroma_out, shift) else 0;
+                    for (cb_in[pairs_done..], cr_in[pairs_done..], pairs_done..) |cb, cr, x| {
+                        std.mem.writeInt(u16, chroma_out[x * 4 ..][0..2], cb << shift, .little);
+                        std.mem.writeInt(u16, chroma_out[x * 4 + 2 ..][0..2], cr << shift, .little);
+                    }
+                }
+            },
+            else => unreachable,
         }
     }
 };
+
+inline fn clampByte(value: i32) u8 {
+    return @intCast(std.math.clamp(value >> 8, 0, 255));
+}
+
+inline fn writeRgb(out: [*]u8, luma: i32, red: i32, green: i32, blue: i32) void {
+    out[0] = clampByte(luma + red);
+    out[1] = clampByte(luma + green);
+    out[2] = clampByte(luma + blue);
+}
+
+fn convertLine(comptime is_444: bool, comptime shift: u4, luma: [*]const u16, cb: [*]const u16, cr: [*]const u16, out: [*]u8, width: usize, use_avx2: bool) void {
+    const samples_per_chroma: usize = if (is_444) 1 else 2;
+    var x: usize = if (simd.compiled and use_avx2) simd.rgb8Line(luma, cb, cr, out, width, shift, is_444) else 0;
+    var chroma: usize = x / samples_per_chroma;
+    while (x < width) : (chroma += 1) {
+        const u: i32 = @as(i32, cb[chroma] >> shift) - 128;
+        const v: i32 = @as(i32, cr[chroma] >> shift) - 128;
+        const red = 459 * v + 128;
+        const green = -55 * u - 136 * v + 128;
+        const blue = 541 * u + 128;
+        const end = @min(x + samples_per_chroma, width);
+        while (x < end) : (x += 1) {
+            const y: i32 = 298 * (@as(i32, luma[x] >> shift) - 16);
+            writeRgb(out + x * 3, y, red, green, blue);
+        }
+    }
+}
 
 /// n-point orthonormal DCT-II basis, `basis[n][x * n + u]`.
 const bases = blk: {
@@ -526,6 +629,12 @@ const bases = blk: {
     }
     break :blk result;
 };
+
+/// `floor(value + 0.5)` clamped to 0..maximum. Clamping first makes the value
+/// non-negative, where truncation is the floor, without a floor call.
+inline fn roundedSample(value: f32, maximum: f32) u16 {
+    return @intFromFloat(@min(@max(value + 0.5, 0), maximum));
+}
 
 /// The n x n inverse DCT of the lowest n x n frequencies of `coefficients`
 /// (stored `u * 8 + v`), scaled by n / 8, into `out[0 .. n * n]` row-major.
@@ -543,9 +652,17 @@ fn reducedIdct(comptime n: usize, coefficients: *const [64]i32, out: *[64]u16, m
     inline for (0..n) |py| inline for (0..n) |px| {
         var sum: f32 = 0;
         inline for (0..n) |v| sum += basis[py * n + v] * tmp[v * n + px];
-        const clamped = @min(@max(@floor(sum + 0.5), 0), max_f);
-        out[py * n + px] = @intFromFloat(clamped);
+        out[py * n + px] = roundedSample(sum, max_f);
     };
+}
+
+/// `reducedIdct` of a block with only its DC coefficient: every sample is the
+/// same, so one is computed.
+fn reducedDc(comptime n: usize, dc: i32, out: *[64]u16, maximum: u16) void {
+    const basis = comptime bases[n][0];
+    const scale: f32 = @as(f32, @floatFromInt(n)) / 8.0;
+    const value = basis * ((@as(f32, @floatFromInt(dc)) * basis) * scale);
+    @memset(out[0 .. n * n], roundedSample(value, @floatFromInt(maximum)));
 }
 
 const testing = std.testing;
@@ -649,6 +766,171 @@ test "full-size decode matches the row decoder sample for sample, on one thread 
             };
         }
     }
+}
+
+test "the portable paths match the row decoder and the AVX2 output" {
+    defer simd.enabled = true;
+    for (progressive_fixtures) |path| {
+        const packet = try readFirstPacket(path);
+        defer testing.allocator.free(packet);
+        const oracle = try rowOracle(packet);
+        defer testing.allocator.free(oracle);
+        simd.enabled = true;
+        var fast_rgb = try decodeRgb8(testing.allocator, packet, .{ .concurrency = 2 });
+        defer fast_rgb.deinit();
+        simd.enabled = false;
+        var portable = try decodeYuv16(testing.allocator, packet, .{ .concurrency = 2 });
+        defer portable.deinit();
+        try testing.expectEqualSlices(u16, oracle, portable.data);
+        var portable_rgb = try decodeRgb8(testing.allocator, packet, .{ .concurrency = 2 });
+        defer portable_rgb.deinit();
+        try testing.expectEqualSlices(u8, portable_rgb.data, fast_rgb.data);
+
+        const width: usize = fast_rgb.width;
+        const pairs = if (portable.is_444) width else (width + 1) / 2;
+        const size = width * 2 * fast_rgb.height + pairs * 4 * fast_rgb.height;
+        const planes = try testing.allocator.alloc(u8, size * 2);
+        defer testing.allocator.free(planes);
+        var decoded: [2][]u8 = undefined;
+        for ([_]bool{ true, false }, 0..) |enabled, index| {
+            simd.enabled = enabled;
+            const memory = planes[index * size ..][0..size];
+            const luma_size = width * 2 * fast_rgb.height;
+            var prepared = try Prepared.init(testing.allocator, packet, .{ .concurrency = 2 });
+            defer prepared.deinit();
+            try prepared.decodeBiplanar(.{ .luma = memory[0..luma_size], .luma_stride_bytes = width * 2, .chroma = memory[luma_size..], .chroma_stride_bytes = pairs * 4 });
+            decoded[index] = memory;
+        }
+        try testing.expectEqualSlices(u8, decoded[1], decoded[0]);
+    }
+}
+
+test "the AVX2 inverse DCT matches the portable one on extreme and random blocks" {
+    if (!simd.compiled or !simd.available()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x1dc7);
+    const random = prng.random();
+    for (0..20_000) |round| {
+        var coefficients: [64]i32 align(32) = undefined;
+        const limit: i32 = switch (round % 4) {
+            0 => 16,
+            1 => 512,
+            2 => 8192,
+            else => 1 << 20,
+        };
+        for (&coefficients) |*value| value.* = if (round % 3 == 0 and random.boolean()) 0 else random.intRangeAtMost(i32, -limit, limit);
+        for ([_]u16{ 255, 1023, 4095 }) |maximum| {
+            var portable: [64]u16 align(32) = undefined;
+            var fast: [64]u16 align(32) = undefined;
+            fast_idct.transformBlock(&coefficients, &portable, maximum);
+            simd.idct8(&coefficients, &fast, maximum);
+            try testing.expectEqualSlices(u16, &portable, &fast);
+        }
+    }
+}
+
+test "AVX2 RGB conversion matches the portable loop and writes only its pixels" {
+    if (!simd.compiled or !simd.available()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x4262);
+    const random = prng.random();
+    const Check = struct {
+        fn run(comptime is_444: bool, comptime shift: u4, rand: std.Random) !void {
+            const top: u16 = (@as(u16, 256) << shift) - 1;
+            var luma: [97]u16 = undefined;
+            var cb: [97]u16 = undefined;
+            var cr: [97]u16 = undefined;
+            for (0..200) |_| {
+                for (&luma, &cb, &cr) |*y, *u, *v| {
+                    y.* = rand.intRangeAtMost(u16, 0, top);
+                    u.* = rand.intRangeAtMost(u16, 0, top);
+                    v.* = rand.intRangeAtMost(u16, 0, top);
+                }
+                const width = rand.intRangeAtMost(usize, 0, luma.len);
+                var portable: [97 * 3 + 8]u8 = @splat(0xa5);
+                var fast: [97 * 3 + 8]u8 = @splat(0xa5);
+                convertLine(is_444, shift, &luma, &cb, &cr, &portable, width, false);
+                convertLine(is_444, shift, &luma, &cb, &cr, &fast, width, true);
+                try testing.expectEqualSlices(u8, &portable, &fast);
+            }
+        }
+    };
+    inline for ([_]u4{ 0, 2, 4 }) |shift| {
+        try Check.run(false, shift, random);
+        try Check.run(true, shift, random);
+    }
+}
+
+test "a corrupt or cut-off packet fails the same with and without the fast bit reads" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    const header = header_mod.parseFrameHeader(packet).?;
+    var spans_buffer: [256]header_mod.RowSpan = undefined;
+    const spans = try header_mod.parseRowSpans(packet, header, &spans_buffer);
+    const t = huffman.sharedTableForCid(header.cid).?;
+    const tables: row.Tables = .{
+        .dc_lookup = &t.dc_lookup,
+        .ac_lookup = &t.ac_lookup,
+        .run_lookup = &t.run_lookup,
+        .ac_info = t.ac_info,
+        .run_values = t.run,
+        .luma_weight = t.luma_weight[0..64],
+        .chroma_weight = t.chroma_weight[0..64],
+        .eob_index = t.eob_index,
+        .index_bits = t.index_bits,
+        .level_bias = t.level_bias,
+        .level_shift = t.level_shift,
+        .fast = &t.fast,
+    };
+    // The same stream, cut at every length: batching only applies with bits to
+    // spare, so both ways of reading must stop at the same place.
+    const whole = packet[spans[0].start..spans[0].end];
+    var length: usize = 0;
+    while (length < @min(whole.len, 2000)) : (length += 7) {
+        const batched = decodeRowStatus(&tables, whole[0..length], false);
+        const unbatched = decodeRowStatus(&tables, whole[0..length], true);
+        try testing.expectEqual(unbatched, batched);
+    }
+
+    // Damaged streams reach every error path: the first-level tables must
+    // stop where the checked reads stop, with the same coefficients.
+    const damaged = try testing.allocator.dupe(u8, whole[0..@min(whole.len, 2000)]);
+    defer testing.allocator.free(damaged);
+    var random = std.Random.DefaultPrng.init(0x564333);
+    var failures: usize = 0;
+    for (0..3000) |_| {
+        @memcpy(damaged, whole[0..damaged.len]);
+        for (0..random.random().intRangeAtMost(usize, 1, 4)) |_| {
+            damaged[random.random().uintLessThan(usize, damaged.len)] ^= @as(u8, 1) << random.random().int(u3);
+        }
+        const batched = decodeRowStatus(&tables, damaged, false);
+        const unbatched = decodeRowStatus(&tables, damaged, true);
+        try testing.expectEqual(unbatched, batched);
+        if (batched[0] != .ok) failures += 1;
+    }
+    try testing.expect(failures > 0);
+}
+
+/// How far one macroblock row's blocks get: the status, the bits consumed and
+/// a hash of what was decoded.
+fn decodeRowStatus(tables: *const row.Tables, bytes: []const u8, disable_batching: bool) struct { row.DecodeError, usize, u64 } {
+    var local = tables.*;
+    var reader = row.BitReader{ .bytes = bytes };
+    if (disable_batching) local.batch_reads = false;
+    var last_dc = [3]i32{ 1 << 10, 1 << 10, 1 << 10 };
+    var luma: row.Quantiser = undefined;
+    var chroma: row.Quantiser = undefined;
+    luma.fill(32, local.luma_weight, local.level_bias);
+    chroma.fill(32, local.chroma_weight, local.level_bias);
+    var coefficients: [64]i32 = undefined;
+    var hash = std.hash.Wyhash.init(0);
+    for (0..400) |block| {
+        @memset(&coefficients, 0);
+        var has_ac = false;
+        const result = row.decodeBlockInto(&local, &reader, &coefficients, block % 8, &last_dc, &luma, &chroma, false, 0, &has_ac);
+        hash.update(std.mem.asBytes(&coefficients));
+        if (result != .ok) return .{ result, reader.bitsRead(), hash.final() };
+        hash.update(&.{@intFromBool(has_ac)});
+    }
+    return .{ .ok, reader.bitsRead(), hash.final() };
 }
 
 test "RGB8 from the new decoder is the same on one thread and on many" {
@@ -797,4 +1079,63 @@ test "biplanar output refuses planes too small for the frame" {
     var chroma: [84 * 23]u8 = undefined;
     try testing.expectError(error.TargetTooSmall, prepared.decodeBiplanar(.{ .luma = &luma, .luma_stride_bytes = 82, .chroma = &chroma, .chroma_stride_bytes = 82 }));
     try prepared.decodeBiplanar(.{ .luma = &luma, .luma_stride_bytes = 82, .chroma = &chroma, .chroma_stride_bytes = 84 });
+}
+
+test "RGB8 into a caller's rows matches the allocating decode and leaves the padding alone" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    for ([_]u2{ 0, 1, 2, 3 }) |log2| {
+        var expected = try decodeRgb8(testing.allocator, packet, .{ .log2_downscale = log2, .concurrency = 1 });
+        defer expected.deinit();
+        const stride = expected.stride_bytes + 7;
+        const target = try testing.allocator.alloc(u8, stride * expected.height);
+        defer testing.allocator.free(target);
+        @memset(target, 0x5a);
+        var prepared = try Prepared.init(testing.allocator, packet, .{ .log2_downscale = log2, .concurrency = 4 });
+        defer prepared.deinit();
+        try prepared.decodeRgb8Into(target, stride);
+        for (0..expected.height) |y| {
+            try testing.expectEqualSlices(u8, expected.data[y * expected.stride_bytes ..][0..expected.stride_bytes], target[y * stride ..][0..expected.stride_bytes]);
+            for (target[y * stride + expected.stride_bytes ..][0..7]) |byte| try testing.expectEqual(@as(u8, 0x5a), byte);
+        }
+    }
+}
+
+test "RGB8 into a caller's rows refuses a target too small for the frame" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    var prepared = try Prepared.init(testing.allocator, packet, .{ .log2_downscale = 3 });
+    defer prepared.deinit();
+    var target: [41 * 3 * 23]u8 = undefined;
+    try testing.expectError(error.TargetTooSmall, prepared.decodeRgb8Into(target[0 .. target.len - 1], 41 * 3));
+    try testing.expectError(error.TargetTooSmall, prepared.decodeRgb8Into(&target, 41 * 3 - 1));
+    try prepared.decodeRgb8Into(&target, 41 * 3);
+}
+
+test "frames decoding at once on several threads each come out right" {
+    const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
+    defer testing.allocator.free(packet);
+    var expected = try decodeRgb8(testing.allocator, packet, .{ .concurrency = 1 });
+    defer expected.deinit();
+    const Caller = struct {
+        fn main(bytes: []const u8, want: []const u8, failed: *std.atomic.Value(bool)) void {
+            for (0..20) |_| {
+                var frame = decodeRgb8(std.heap.smp_allocator, bytes, .{ .concurrency = 4 }) catch {
+                    failed.store(true, .monotonic);
+                    return;
+                };
+                defer frame.deinit();
+                if (!std.mem.eql(u8, want, frame.data)) failed.store(true, .monotonic);
+            }
+        }
+    };
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Caller.main, .{ packet, expected.data, &failed });
+    for (threads) |thread| thread.join();
+    try testing.expect(!failed.load(.monotonic));
+}
+
+test {
+    _ = worker_pool;
 }

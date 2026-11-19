@@ -41,4 +41,25 @@ pub fn build(b: *std.Build) void {
     run_example.addPassthruArgs();
     const example_step = b.step("example", "Decode frame 0 of an MXF (pass path after --)");
     example_step.dependOn(&run_example.step);
+
+    const bench = b.addExecutable(.{
+        .name = "native_decode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/native_decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "turbovc3", .module = mod },
+            },
+        }),
+    });
+    bench.root_module.link_libc = true;
+    const install_bench = b.addInstallArtifact(bench, .{});
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    run_bench.step.dependOn(&install_bench.step);
+    const bench_step = b.step("bench", "Benchmark the native frame decoder (pass MXF paths after --)");
+    bench_step.dependOn(&run_bench.step);
+    const bench_install_step = b.step("bench-install", "Build and install the native frame decoder benchmark");
+    bench_install_step.dependOn(&install_bench.step);
 }

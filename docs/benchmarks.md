@@ -24,6 +24,25 @@ GitHub runners. Performance comparisons are meaningful only on the same machine,
 iteration count. Capture those fields with the JSON result when investigating a regression; named baseline hardware
 and release-blocking budgets remain future qualification work.
 
+## Native frame decoder
+
+`zig build bench -Doptimize=ReleaseFast -- FILE.mxf...` times the native frame decoder on each file's first
+frame, for RGB8 (allocating and into a caller's buffer), biplanar and planar output, at several thread counts and at
+full, half and quarter size. Use more than one kind of clip. DNx frames are constant size, so a flat clip and a
+detailed one have the same bitrate but very different costs: flat footage is mostly DC-only blocks, while detailed
+footage spends most of its time in entropy decoding.
+
+Biplanar output in frames per second, baseline x86-64 `ReleaseFast`, Ryzen 9 9950X3D on Windows, before and after the
+shared worker pool's lock-free dispatch and the first-level entropy tables. The detailed clips are FFmpeg `testsrc2`
+with strong temporal noise, encoded as DNxHR HQ.
+
+| Clip | 1 thread | Default threads |
+| --- | --- | --- |
+| DNxHR HQ 1080p, flat | 216 to 875 | 382 to 7753 |
+| DNxHR HQ 2160p, flat | 52 to 215 | 192 to 2143 |
+| DNxHR HQ 1080p, detailed | 53 to 222 | 328 to 2681 |
+| DNxHR HQ 2160p, detailed | 13 to 55 | 123 to 723 |
+
 ## WebAssembly build flags
 
 `scripts/build-dnx-zig-wasm.sh` builds the Zig row decoder with `-O ReleaseFast -fstrip` and
