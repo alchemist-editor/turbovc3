@@ -61,6 +61,9 @@ pub fn decodeFrameYuv8(allocator: std.mem.Allocator, packet: []const u8) !YuvFra
     defer decode_mutex.unlock();
 
     if (packet.len > row_decoder.dnx_packet_capacity()) return error.PacketTooLarge;
+    // The spans buffer takes every row a header can address; the row
+    // decoder's start/end arrays below hold only its row capacity.
+    if (spans.len > row_decoder.dnx_rows_capacity()) return error.TooManyRows;
     const sample_bytes: usize = if (hdr.bit_depth == 8) 1 else 2;
     switch (row_decoder.dnx_reserve_frame(@intCast(packet.len), @intCast(out_len * sample_bytes))) {
         0 => {},
@@ -176,4 +179,26 @@ pub fn decodeFrameRgb8(allocator: std.mem.Allocator, packet: []const u8) !RgbFra
         .stride_bytes = stride,
         .allocator = allocator,
     };
+}
+
+test "a packet with more rows than the row decoder holds is refused before its spans are copied" {
+    // A synthetic DNxHR HQ header: 1920 wide, 275 macroblock rows (over the
+    // row decoder's 270, under the 2048 a header can address), an all-zero
+    // scan table and a little payload. It fits the packet and frame buffers,
+    // so only the row check stands between it and the 270-entry span arrays.
+    const rows: u32 = 275;
+    const data_offset: u32 = 0x170 + rows * 4;
+    var packet: [data_offset + 64]u8 = @splat(0);
+    std.mem.writeInt(u32, packet[0..4], data_offset, .big);
+    packet[4] = 0x03;
+    std.mem.writeInt(u16, packet[0x18..0x1a], @intCast(rows * 16), .big);
+    std.mem.writeInt(u16, packet[0x1a..0x1c], 1920, .big);
+    packet[0x21] = 1 << 5; // 8-bit
+    std.mem.writeInt(u32, packet[0x28..0x2c], 1272, .big);
+    std.mem.writeInt(u16, packet[0x16c..0x16e], @intCast(rows), .big);
+    const hdr = header_mod.parseFrameHeader(&packet).?;
+    try std.testing.expect(hdr.supported);
+    try std.testing.expectEqual(rows, hdr.macroblock_height);
+    try std.testing.expect(rows > row_decoder.dnx_rows_capacity());
+    try std.testing.expectError(error.TooManyRows, decodeFrameYuv8(std.testing.allocator, &packet));
 }
