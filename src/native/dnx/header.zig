@@ -130,6 +130,11 @@ pub fn parseFrameHeader(packet: []const u8) ?FrameHeader {
 
 pub const RowSpan = struct { row: u32, start: u32, end: u32 };
 
+/// The most macroblock rows a DNx packet can code: its scan table runs from
+/// 0x170 to data_offset, and parsePrefix accepts data_offset up to 0x2170.
+/// Size a parseRowSpans buffer with this, not with a picture size.
+pub const max_rows = (0x2170 - 0x170) / 4;
+
 pub fn parseRowSpans(packet: []const u8, header: FrameHeader, out: []RowSpan) ![]RowSpan {
     if (packet.len <= header.data_offset) return error.NoPayload;
     const payload_length: u32 = @intCast(packet.len - header.data_offset);

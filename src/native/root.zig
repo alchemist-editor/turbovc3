@@ -46,7 +46,7 @@ test "decode oracle beach frame0.bin when present" {
     defer std.testing.allocator.free(bytes);
     const hdr = dnx.parseFrameHeader(bytes) orelse return error.BadHeader;
     try std.testing.expectEqual(@as(u32, 1272), hdr.cid);
-    var spans_buf: [256]dnx.header.RowSpan = undefined;
+    var spans_buf: [dnx.header.max_rows]dnx.header.RowSpan = undefined;
     const spans = try dnx.header.parseRowSpans(bytes, hdr, &spans_buf);
     try std.testing.expectEqual(@as(usize, 68), spans.len);
     var frame = try dnx.decodeFrameRgb8(std.testing.allocator, bytes);

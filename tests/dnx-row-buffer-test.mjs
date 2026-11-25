@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// The shared-row path copies at most the Zig row buffer (1 MiB) of a row.
+// The shared-row path copies at most the Zig row buffer (2 MiB) of a row.
 // That is only safe if (1) no valid row needs more, (2) the Zig bit reader
 // fails at the end of the bytes it is given instead of reading past them, and
 // (3) a row whose coded data is corrupt or does not end within the buffer is
-// an ordinary decode error that leaves the decoder on the row workers. 8K
-// frames, over the Zig limits, are refused up front with an error naming the
-// supported size.
+// an ordinary decode error that leaves the decoder on the row workers. Frames
+// past 8K DCI, over the Zig limits, are refused up front with an error naming
+// the supported size (8K itself is tests/dnx-8k-test.mjs).
 //
 // Needs the built WebAssembly modules (npm run build:wasm); runs in test:native.
 import assert from "node:assert/strict";
@@ -96,14 +96,14 @@ try {
   // A corrupt last row is an ordinary decode error, whatever its span: no
   // start error, the decoder stays on the row workers, and the next frame
   // decodes there exactly as on a fresh decoder.
-  // 1080p HQX whose last row is 1 MiB + 4 KiB of bytes that are not valid DNx.
+  // 1080p HQX whose last row is the row buffer + 4 KiB of bytes that are not valid DNx.
   {
     const valid = await firstPacket("oracle_dnxhr_hqx_1080p30_10bit_cid1271.mov");
     const lastRow = parseDnxRowSpans(valid, parseDnxFrameHeader(valid)).at(-1);
     const corrupt = new Uint8Array(lastRow.start + ROW_BUFFER + 4096).fill(0xff);
     corrupt.set(valid.subarray(0, lastRow.start));
     assert.ok(parseDnxRowSpans(corrupt, parseDnxFrameHeader(corrupt)).at(-1).byteLength > ROW_BUFFER);
-    await corruptLastRowStaysOnRowWorkers("1080p HQX, 1 MiB + 4 KiB invalid last row", corrupt, valid);
+    await corruptLastRowStaysOnRowWorkers("1080p HQX, row buffer + 4 KiB invalid last row", corrupt, valid);
   }
   // 2160p HQX, the case that used to demote: its last row is always capped.
   // Flip bytes inside the last row's coded data.
@@ -116,23 +116,28 @@ try {
     await corruptLastRowStaysOnRowWorkers("2160p HQX, corrupted last row", corrupt, valid);
   }
 
-  // 8K (4320p: 480 macroblocks wide, a 14.6 MB packet) is over every Zig
-  // limit. The header check refuses it before any backend sees it, naming
-  // the supported size; no worker backend is blamed or abandoned.
+  // Past 8K DCI (8192x4320, the Zig limits): refused up front with an error
+  // naming the supported size; no worker backend is blamed or abandoned.
+  // The 7680x4320 fixture's header, rewritten to claim 8704 pixels wide.
   {
-    const packet = await firstPacket("dnxhr_hqx_4320p30_smptehdbars.mov.gz");
-    assert.equal(parseDnxFrameHeader(packet).macroblockWidth, 480);
+    // padded to the frame size that width implies.
+    const source = (await firstPacket("dnxhr_hqx_4320p30_smptehdbars.mov.gz")).slice();
+    new DataView(source.buffer, source.byteOffset).setUint16(0x1a, 8704);
+    const wide = parseDnxFrameHeader(source);
+    assert.equal(wide.macroblockWidth, 544);
+    const packet = new Uint8Array(Math.max(source.byteLength, wide.expectedFrameSize ?? 0));
+    packet.set(source);
     const { decoder, startErrors } = await rowWorkerDecoder();
     try {
       const result = await decoder.decode(packet, new Frame());
       assert.ok(result instanceof DnxNotSupportedError, `got ${result?.constructor?.name}`);
-      assert.match(result.message, /limited to 4096x2160 frames/);
+      assert.match(result.message, /limited to 8192x4320 frames/);
       assert.deepEqual(startErrors, []);
       assert.equal(decoder.idctMode, "shared-row-workers/zig-wasm-row");
     } finally {
       await decoder.close();
     }
-    console.log("ok - a 4320p frame is refused up front with an error naming the 4096x2160 limit");
+    console.log("ok - a frame wider than 8192 is refused up front with an error naming the 8192x4320 limit");
   }
 } finally {
   server.close();

@@ -98,6 +98,14 @@ All notable changes to turbovc3 will be documented here.
 
 ### Fixed
 
+- 8K DNxHR decodes (issue #24). The Zig/WASM decoder's limits are now 8K DCI, 8192×4320: 512 macroblocks wide
+  (was 256), 270 rows (was 256), a 32 MiB packet (was 8 MiB) and a frame of up to 8192×4320×3 16-bit samples (was
+  56 MiB), with a 2 MiB row buffer for the wider rows. The packet and frame buffers are no longer static: they grow
+  on the first whole-frame decode that needs them (`dnx_reserve_frame`, row decoder ABI version 5), so an instance
+  that only decodes rows stays small. The native Zig decoders sized their row-span arrays at 256 rows, so 4320-line
+  frames failed there too; they now take every row a DNx header can address. The up-front size check and Mediabunny's
+  `supports()` accept up to 8192×4320 (`DNX_MAX_DECODE_WIDTH`, `DNX_MAX_DECODE_HEIGHT`).
+
 - 2160p DNxHR (HQ, HQX, 444) decodes on shared-memory row workers. DNxHR frames are padded to a fixed size and the
   last row's span runs to the end of the payload, megabytes past the 1 MiB Zig row buffer; a row worker now copies
   at most the buffer, since decoding stops after the row's macroblocks (#23).
