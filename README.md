@@ -152,7 +152,7 @@ jobs already accepted by the underlying decoder.
 | Area           | Current support                                                                                                                                                         |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Sample entries | `AVdn` (DNxHD), `AVdh` (DNxHR)                                                                                                                                          |
-| Frames         | Progressive through 4096×2160; interlaced DNxHD CIDs 1241–1244; field-coded and MBAFF CID 1260                                                                          |
+| Frames         | Progressive through 8192×4320 (8K DCI); interlaced DNxHD CIDs 1241–1244; field-coded and MBAFF CID 1260                                                                 |
 | Native output  | 8/10/12-bit 4:2:2; 10/12-bit 4:4:4 YUV/RGB                                                                                                                              |
 | Conversion     | 8/10/12-bit 4:2:2 to 4:2:0/4:4:4; planar DNx RGB to 4:4:4 YUV                                                                                                           |
 | MOV/QuickTime  | Through Mediabunny                                                                                                                                                      |

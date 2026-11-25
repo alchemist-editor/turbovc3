@@ -2,7 +2,7 @@
 // 2160p DNxHR on the shared-memory row-worker path (issue #23). DNxHR frames
 // are padded to a fixed size and the row-span parser runs the last row to the
 // end of the payload, so a 4K frame's last row spans 2-7 MB of mostly padding,
-// past the 1 MiB Zig row buffer. Each frame must decode on the row workers and
+// past the 2 MiB Zig row buffer. Each frame must decode on the row workers and
 // match the packet-worker output byte for byte.
 //
 // Needs the built WebAssembly modules (npm run build:wasm): Node workers load
@@ -19,7 +19,7 @@ import { createNodeDecoder } from "../dist/node.js";
 import { parseDnxRowSpans } from "../dist/dnxReconstruction.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ROW_BUFFER_BYTES = 1024 * 1024;
+const ROW_BUFFER_BYTES = 2 * 1024 * 1024;
 
 const server = createServer(async (request, response) => {
   try {

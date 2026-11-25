@@ -268,7 +268,7 @@ const Job = struct {
     packet: []const u8,
     hdr: header_mod.FrameHeader,
     row_tables: row.Tables,
-    spans: [256]header_mod.RowSpan,
+    spans: [header_mod.max_rows]header_mod.RowSpan,
     span_count: usize,
     log2: u2,
     concurrency: u32,
@@ -706,7 +706,7 @@ fn rowOracle(packet: []const u8) ![]u16 {
     @memcpy(@as([*]u8, @ptrFromInt(row.dnx_run_values_ptr()))[0..set.run.len], set.run);
     @memcpy(@as([*]u16, @ptrFromInt(row.dnx_luma_weight_ptr()))[0..64], set.luma_weight[0..64]);
     @memcpy(@as([*]u16, @ptrFromInt(row.dnx_chroma_weight_ptr()))[0..64], set.chroma_weight[0..64]);
-    var spans_buf: [256]header_mod.RowSpan = undefined;
+    var spans_buf: [header_mod.max_rows]header_mod.RowSpan = undefined;
     const spans = try header_mod.parseRowSpans(packet, hdr, &spans_buf);
 
     const width: usize = hdr.macroblock_width * 16;
@@ -717,7 +717,10 @@ fn rowOracle(packet: []const u8) ![]u16 {
     const row_buffer: [*]u8 = @ptrFromInt(row.dnx_row_buffer_ptr());
     const samples: [*]const u16 = @ptrFromInt(row.dnx_samples_ptr());
     for (spans, 0..) |span, r| {
-        const bytes = packet[span.start..span.end];
+        // The last row's span runs to the end of the padded payload, past
+        // the row buffer at 4K and up; the decoder stops after the row's
+        // macroblocks, so the browser's row workers copy at most this much.
+        const bytes = packet[span.start..@min(span.end, span.start + row.dnx_row_capacity())];
         @memcpy(row_buffer[0..bytes.len], bytes);
         const result = row.dnx_decode_row(@intCast(bytes.len), hdr.macroblock_width, hdr.bit_depth, @intCast(set.ac_info.len), @intCast(set.run.len), set.eob_index, set.index_bits, set.level_bias, set.level_shift, @intFromBool(hdr.is_444));
         if (result != 0) return error.RowDecodeFailed;
@@ -765,6 +768,38 @@ test "full-size decode matches the row decoder sample for sample, on one thread 
                 return err;
             };
         }
+    }
+}
+
+test "8K DCI (8192x4320, 270 rows of 512 macroblocks) matches the row decoder" {
+    const gz = try std.Io.Dir.cwd().readFileAlloc(testing.io, "tests/fixtures/dnxhr_hq_8192x4320_smptehdbars.mxf.gz", testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(gz);
+    var compressed: std.Io.Reader = .fixed(gz);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&compressed, .gzip, &window);
+    const container = try inflate.reader.allocRemaining(testing.allocator, .limited(64 * 1024 * 1024));
+    defer testing.allocator.free(container);
+    const reader_mod = @import("../reader.zig");
+    const mxf = @import("../mxf/mod.zig");
+    var source: reader_mod.SliceReader = .{ .bytes = container };
+    const r = source.reader();
+    var demuxed = try mxf.demuxFile(testing.allocator, r, .{});
+    defer demuxed.deinit();
+    var iter = demuxed.packetsForTrack(demuxed.primaryVideoTrack() orelse return error.NoVideo);
+    const packet = try demuxed.readPacket(r, iter.next() orelse return error.NoPackets);
+    defer testing.allocator.free(packet);
+    const hdr = header_mod.parseFrameHeader(packet).?;
+    try testing.expectEqual(@as(u32, 512), hdr.macroblock_width);
+    try testing.expectEqual(@as(u32, 270), hdr.macroblock_height);
+
+    const oracle = try rowOracle(packet);
+    defer testing.allocator.free(oracle);
+    for ([_]u32{ 1, 8 }) |threads| {
+        var frame = try decodeYuv16(testing.allocator, packet, .{ .concurrency = threads });
+        defer frame.deinit();
+        try testing.expectEqual(@as(u32, 8192), frame.width);
+        try testing.expectEqual(@as(u32, 4320), frame.height);
+        try testing.expectEqualSlices(u16, oracle, frame.data);
     }
 }
 
@@ -863,7 +898,7 @@ test "a corrupt or cut-off packet fails the same with and without the fast bit r
     const packet = try readFirstPacket("tests/fixtures/dnxhr_hq_328x184.mxf");
     defer testing.allocator.free(packet);
     const header = header_mod.parseFrameHeader(packet).?;
-    var spans_buffer: [256]header_mod.RowSpan = undefined;
+    var spans_buffer: [header_mod.max_rows]header_mod.RowSpan = undefined;
     const spans = try header_mod.parseRowSpans(packet, header, &spans_buffer);
     const t = huffman.sharedTableForCid(header.cid).?;
     const tables: row.Tables = .{

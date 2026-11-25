@@ -18,6 +18,8 @@ import { Decoder, DnxDecoderError, Frame, type FilledFrame } from "./dnxDecoder.
 import { acquireSharedDecoder, type SharedDecoderLease } from "./dnxSharedDecoderPool.js";
 import type { DnxWasmUrls, DnxWorkerStartError, DnxWorkerUrls } from "./dnxWorker.js";
 import {
+  DNX_MAX_DECODE_HEIGHT,
+  DNX_MAX_DECODE_WIDTH,
   DNX_SAMPLE_ENTRIES,
   parseDnxFrameHeader,
   type DnxFourCc,
@@ -184,8 +186,8 @@ class MediabunnyDnxDecoder extends CustomVideoDecoder {
     return (
       (codec as string) === "dnx" &&
       dnxFourCc !== null &&
-      (config.codedWidth ?? 1920) <= 4096 &&
-      (config.codedHeight ?? 1080) <= 2160
+      (config.codedWidth ?? 1920) <= DNX_MAX_DECODE_WIDTH &&
+      (config.codedHeight ?? 1080) <= DNX_MAX_DECODE_HEIGHT
     );
   }
 

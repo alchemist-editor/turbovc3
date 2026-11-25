@@ -149,6 +149,12 @@ export function deinterlaceDnxFrameLayout(source: DnxFrameLayout, parity: DnxFie
 // @public (undocumented)
 export function demuxDnxMxf(input: MxfSourceInput, options?: MxfDemuxOptions): Promise<DnxMxfDemuxResult | null>;
 
+// @public
+export const DNX_MAX_DECODE_HEIGHT = 4320;
+
+// @public
+export const DNX_MAX_DECODE_WIDTH = 8192;
+
 // @public (undocumented)
 export const DNX_SAMPLE_ENTRIES: readonly ["AVdn", "AVdh"];
 

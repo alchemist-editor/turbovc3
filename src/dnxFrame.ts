@@ -1,6 +1,15 @@
 import type { DecodeColorSpace, DecodePixelFormat } from "./core/codec.js";
 
 export const DNX_SAMPLE_ENTRIES = ["AVdn", "AVdh"] as const;
+
+/**
+ * The widest frame turbovc3 decodes: 8K DCI, 512 macroblocks. The Zig/WASM
+ * decoder's row and frame buffers are sized for it.
+ */
+export const DNX_MAX_DECODE_WIDTH = 8192;
+
+/** The tallest frame turbovc3 decodes: 8K, 270 macroblock rows. */
+export const DNX_MAX_DECODE_HEIGHT = 4320;
 export type DnxFourCc = (typeof DNX_SAMPLE_ENTRIES)[number];
 
 export type DnxProfile =
@@ -375,8 +384,8 @@ function unsupportedReasonsFor(options: {
       );
     }
   }
-  if (options.width > 4096 || options.height > 2160) {
-    reasons.push("Progressive DNxHR decode is limited to 4096x2160 frames.");
+  if (options.width > DNX_MAX_DECODE_WIDTH || options.height > DNX_MAX_DECODE_HEIGHT) {
+    reasons.push(`DNx decode is limited to ${DNX_MAX_DECODE_WIDTH}x${DNX_MAX_DECODE_HEIGHT} frames.`);
   }
   if (options.alpha || options.lowLatencyAlpha) {
     reasons.push("DNx alpha output is deferred.");

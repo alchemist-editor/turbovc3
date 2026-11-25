@@ -1,11 +1,18 @@
+const builtin = @import("builtin");
 const fast_idct = @import("dnx_fast_idct.zig");
 const std = @import("std");
 
-const MAX_ROW_BYTES = 1024 * 1024;
-const MAX_PACKET_BYTES = 8 * 1024 * 1024;
-const MAX_FRAME_BYTES = 56 * 1024 * 1024;
-const MAX_MACROBLOCKS = 256;
-const MAX_ROWS = 256;
+// The limits are 8K DCI: 8192x4320, 512 macroblocks wide and 270 rows.
+// A row of 512 macroblocks can code up to about 1.6 MB in the worst case
+// (tests/dnx-row-buffer-test.mjs works it out from the tables).
+const MAX_ROW_BYTES = 2 * 1024 * 1024;
+const MAX_MACROBLOCKS = 512;
+const MAX_ROWS = 270;
+// The largest DNxHR packet at that size, 4:4:4 (57344/255 bytes per
+// macroblock), is about 31.1 MB.
+const MAX_PACKET_BYTES = 32 * 1024 * 1024;
+// 8192x4320, three full planes of 16-bit samples.
+const MAX_FRAME_BYTES = MAX_MACROBLOCKS * 16 * MAX_ROWS * 16 * 3 * 2;
 const MAX_BLOCKS_PER_MACROBLOCK = 12;
 const MAX_BLOCKS = MAX_MACROBLOCKS * MAX_BLOCKS_PER_MACROBLOCK;
 pub const LOOKUP_SIZE = 1 << 16;
@@ -13,10 +20,15 @@ const MAX_AC_INFO = 1024;
 const MAX_RUN_VALUES = 64;
 
 var row_bytes: [MAX_ROW_BYTES]u8 align(16) = undefined;
-var packet_bytes: [MAX_PACKET_BYTES]u8 align(16) = undefined;
+// The packet and frame buffers are sized on demand by dnx_reserve_frame, up
+// to the limits above. Static buffers that large would commit the full 8K
+// size (about 240 MB) in every instance, row workers included, which only
+// ever decode rows.
+var packet_bytes: []align(16) u8 = &.{};
 var row_starts: [MAX_ROWS]u32 align(16) = undefined;
 var row_ends: [MAX_ROWS]u32 align(16) = undefined;
-var frame_bytes: [MAX_FRAME_BYTES]u8 align(16) = undefined;
+var frame_bytes: []align(16) u8 = &.{};
+const buffer_allocator = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else std.heap.page_allocator;
 var dc_lookup: [LOOKUP_SIZE]u16 align(16) = @splat(0);
 var ac_lookup: [LOOKUP_SIZE]u16 align(16) = @splat(0);
 var run_lookup: [LOOKUP_SIZE]u16 align(16) = @splat(0);
@@ -211,6 +223,7 @@ pub const DecodeError = enum(u32) {
     run_vlc = 8,
     coefficient_overrun = 9,
     ac_vlc = 10,
+    out_of_memory = 11,
 };
 
 pub const BitReader = struct {
@@ -306,7 +319,7 @@ pub const BitReader = struct {
 };
 
 pub export fn dnx_row_decoder_version() u32 {
-    return 4;
+    return 5;
 }
 
 pub export fn dnx_row_capacity() u32 {
@@ -329,8 +342,14 @@ pub export fn dnx_packet_capacity() u32 {
     return MAX_PACKET_BYTES;
 }
 
+/// The packet buffer; valid for dnx_packet_buffer_length() bytes, after a
+/// successful dnx_reserve_frame. Reserving again may move it.
 pub export fn dnx_packet_buffer_ptr() usize {
-    return @intFromPtr(&packet_bytes);
+    return @intFromPtr(packet_bytes.ptr);
+}
+
+pub export fn dnx_packet_buffer_length() u32 {
+    return @intCast(packet_bytes.len);
 }
 
 pub export fn dnx_row_starts_ptr() usize {
@@ -345,8 +364,39 @@ pub export fn dnx_frame_capacity() u32 {
     return MAX_FRAME_BYTES;
 }
 
+/// The frame buffer; valid for dnx_frame_buffer_length() bytes, after a
+/// successful dnx_reserve_frame. Reserving again may move it.
 pub export fn dnx_frame_buffer_ptr() usize {
-    return @intFromPtr(&frame_bytes);
+    return @intFromPtr(frame_bytes.ptr);
+}
+
+pub export fn dnx_frame_buffer_length() u32 {
+    return @intCast(frame_bytes.len);
+}
+
+/// Make the packet and frame buffers at least this large. Returns ok,
+/// invalid_arguments past dnx_packet_capacity or dnx_frame_capacity, or
+/// out_of_memory. Grown buffers keep no contents, so reserve before writing
+/// the packet; WebAssembly memory may grow, so re-read memory.buffer after.
+pub export fn dnx_reserve_frame(packet_length: u32, frame_byte_length: u32) u32 {
+    if (packet_length > MAX_PACKET_BYTES or frame_byte_length > MAX_FRAME_BYTES) {
+        return @backingInt(DecodeError.invalid_arguments);
+    }
+    if (!reserve(&packet_bytes, packet_length) or !reserve(&frame_bytes, frame_byte_length)) {
+        return @backingInt(DecodeError.out_of_memory);
+    }
+    return @backingInt(DecodeError.ok);
+}
+
+fn reserve(buffer: *[]align(16) u8, length: u32) bool {
+    if (buffer.len >= length) return true;
+    // Whole MiBs, so a stream whose packets vary by a few bytes does not
+    // reallocate every frame.
+    const rounded = std.mem.alignForward(usize, length, 1024 * 1024);
+    const grown = buffer_allocator.alignedAlloc(u8, .@"16", rounded) catch return false;
+    if (buffer.len != 0) buffer_allocator.free(buffer.*);
+    buffer.* = grown;
+    return true;
 }
 
 pub export fn dnx_dc_lookup_ptr() usize {
@@ -453,7 +503,7 @@ pub export fn dnx_decode_frame(
     is_444: u32,
     mbaff: u32,
 ) u32 {
-    if (packet_length > MAX_PACKET_BYTES or macroblock_width == 0 or macroblock_width > MAX_MACROBLOCKS or
+    if (packet_length > packet_bytes.len or macroblock_width == 0 or macroblock_width > MAX_MACROBLOCKS or
         macroblock_height == 0 or macroblock_height > MAX_ROWS or
         (bit_depth != 8 and bit_depth != 10 and bit_depth != 12) or ac_info_length > MAX_AC_INFO or
         run_values_length > MAX_RUN_VALUES or level_shift > 31 or is_444 > 1 or mbaff > 1)
@@ -463,7 +513,7 @@ pub export fn dnx_decode_frame(
     const bytes_per_sample: u64 = if (bit_depth == 8) 1 else 2;
     const plane_count: u64 = if (is_444 != 0) 3 else 2;
     const frame_byte_length = @as(u64, macroblock_width) * 16 * macroblock_height * 16 * plane_count * bytes_per_sample;
-    if (frame_byte_length > MAX_FRAME_BYTES) return @backingInt(DecodeError.invalid_arguments);
+    if (frame_byte_length > frame_bytes.len) return @backingInt(DecodeError.invalid_arguments);
 
     for (0..macroblock_height) |row| {
         diagnostic_row = @intCast(row);
@@ -984,7 +1034,7 @@ fn storeBlock(
     const samples_ptr: [*]u16 = @ptrCast(&samples);
     const sample_start = block * 64;
     if (bytes_per_sample == 1) {
-        const frame_ptr: [*]u8 = @ptrCast(&frame_bytes);
+        const frame_ptr: [*]u8 = frame_bytes.ptr;
         for (0..8) |block_row| {
             const output_start = plane_start + (y + block_row * line_step) * stride_samples + x;
             const input_start = sample_start + block_row * 8;
@@ -993,7 +1043,7 @@ fn storeBlock(
             target.* = @truncate(source.*);
         }
     } else {
-        const frame_ptr: [*]u16 = @ptrCast(@alignCast(&frame_bytes));
+        const frame_ptr: [*]u16 = @ptrCast(frame_bytes.ptr);
         const plane_start_samples = plane_start / 2;
         for (0..8) |block_row| {
             const output_start = plane_start_samples + (y + block_row * line_step) * stride_samples + x;
@@ -1011,6 +1061,7 @@ test "native decode oracle frame via export buffers" {
     const data_offset: u32 = 0x280;
     const macroblock_width: u32 = 120;
     const macroblock_height: u32 = 68;
+    try std.testing.expectEqual(@as(u32, 0), dnx_reserve_frame(@intCast(bytes.len), macroblock_width * 16 * macroblock_height * 16 * 2));
     @memcpy(packet_bytes[0..bytes.len], bytes);
     const payload_length: u32 = @intCast(bytes.len - data_offset);
     var row: u32 = 0;

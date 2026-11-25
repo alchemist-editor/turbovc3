@@ -47,7 +47,7 @@ pub fn decodeFrameYuv8(allocator: std.mem.Allocator, packet: []const u8) !YuvFra
     if (hdr.interlaced) return error.InterlacedNotSupported;
     var table_set = huffman.tableForCid(hdr.cid) orelse return error.UnsupportedDnxCid;
 
-    var spans_buf: [256]header_mod.RowSpan = undefined;
+    var spans_buf: [header_mod.max_rows]header_mod.RowSpan = undefined;
     const spans = try header_mod.parseRowSpans(packet, hdr, &spans_buf);
 
     const coded_w = hdr.macroblock_width * 16;
@@ -61,6 +61,12 @@ pub fn decodeFrameYuv8(allocator: std.mem.Allocator, packet: []const u8) !YuvFra
     defer decode_mutex.unlock();
 
     if (packet.len > row_decoder.dnx_packet_capacity()) return error.PacketTooLarge;
+    const sample_bytes: usize = if (hdr.bit_depth == 8) 1 else 2;
+    switch (row_decoder.dnx_reserve_frame(@intCast(packet.len), @intCast(out_len * sample_bytes))) {
+        0 => {},
+        11 => return error.OutOfMemory,
+        else => return error.FrameTooLarge,
+    }
     const packet_ptr: [*]u8 = @ptrFromInt(row_decoder.dnx_packet_buffer_ptr());
     @memcpy(packet_ptr[0..packet.len], packet);
 

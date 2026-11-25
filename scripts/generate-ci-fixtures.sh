@@ -168,21 +168,25 @@ run_ffmpeg -v error -y \
   "$OUTPUT_DIR/dnxhr-lb-opatom.mxf"
 
 # 2160p DNxHR (issue #23): padded to a fixed frame size, so the last row's span
-# exceeds the 1 MiB Zig row buffer. 4320p: over every Zig limit. Stored
+# exceeds the 2 MiB Zig row buffer. 8K (issue #24): 7680x4320 UHD, and
+# 8192x4320 DCI, the decoder's limit, at 4:4:4 its largest packet and frame;
+# the 8-bit HQ one is MXF so the native Zig tests can read it too. Stored
 # gzipped; the padding compresses to almost nothing.
 for fixture in \
-  "dnxhr_hqx_2160p30_testsrc testsrc 3840x2160 yuv422p10le dnxhr_hqx" \
-  "dnxhr_hq_2160p30_testsrc testsrc 3840x2160 yuv422p dnxhr_hq" \
-  "dnxhr_444_2160p30_testsrc testsrc 3840x2160 yuv444p10le dnxhr_444" \
-  "dnxhr_hqx_4320p30_smptehdbars smptehdbars 7680x4320 yuv422p10le dnxhr_hqx"
+  "dnxhr_hqx_2160p30_testsrc testsrc 3840x2160 yuv422p10le dnxhr_hqx mov" \
+  "dnxhr_hq_2160p30_testsrc testsrc 3840x2160 yuv422p dnxhr_hq mov" \
+  "dnxhr_444_2160p30_testsrc testsrc 3840x2160 yuv444p10le dnxhr_444 mov" \
+  "dnxhr_hqx_4320p30_smptehdbars smptehdbars 7680x4320 yuv422p10le dnxhr_hqx mov" \
+  "dnxhr_hq_8192x4320_smptehdbars smptehdbars 8192x4320 yuv422p dnxhr_hq mxf" \
+  "dnxhr_444_8192x4320_smptehdbars smptehdbars 8192x4320 yuv444p10le dnxhr_444 mov"
 do
-  read -r name source size format profile <<< "$fixture"
+  read -r name source size format profile container <<< "$fixture"
   run_ffmpeg -v error -y \
     -f lavfi -i "$source=size=$size:rate=30:duration=1" \
     -frames:v 1 -pix_fmt "$format" -c:v dnxhd -profile:v "$profile" -an \
     -metadata creation_time=1970-01-01T00:00:00Z \
-    "$OUTPUT_DIR/$name.mov"
-  gzip -n -9 -f "$OUTPUT_DIR/$name.mov"
+    "$OUTPUT_DIR/$name.$container"
+  gzip -n -9 -f "$OUTPUT_DIR/$name.$container"
 done
 
 for fixture in \

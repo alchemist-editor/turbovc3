@@ -66,6 +66,7 @@ interface DnxZigWasmExports {
   dnx_row_ends_ptr: () => number;
   dnx_frame_capacity: () => number;
   dnx_frame_buffer_ptr: () => number;
+  dnx_reserve_frame: (packetLength: number, frameByteLength: number) => number;
   dnx_dc_lookup_ptr: () => number;
   dnx_ac_lookup_ptr: () => number;
   dnx_run_lookup_ptr: () => number;
@@ -122,7 +123,8 @@ const ERROR_MESSAGES = [
   "unexpected end of AC level",
   "invalid run VLC",
   "AC coefficients overran the block",
-  "invalid AC VLC"
+  "invalid AC VLC",
+  "out of memory"
 ] as const;
 
 const compiledModules = new Map<string, Promise<WebAssembly.Module>>();
@@ -147,7 +149,7 @@ export async function createDnxWasmRowDecoder(
   const instance = await WebAssembly.instantiate(module, {});
   const exports = instance.exports as unknown as DnxZigWasmExports;
   validateExports(exports);
-  if (exports.dnx_row_decoder_version() !== 4) {
+  if (exports.dnx_row_decoder_version() !== 5) {
     throw new Error(`Unsupported DNx Zig row decoder version ${exports.dnx_row_decoder_version()}.`);
   }
 
@@ -184,7 +186,9 @@ class DnxZigWasmRowDecoder implements DnxRowDecoder {
       throw new Error("DNx Zig row decoder is destroyed.");
     }
     if (packet.byteLength > this.capacities.packetBytes) {
-      throw new Error(`DNx packet requires ${packet.byteLength} bytes, exceeding the Zig buffer capacity.`);
+      throw new Error(
+        `DNx packet requires ${packet.byteLength} bytes, exceeding the Zig buffer capacity of ${this.capacities.packetBytes} bytes.`
+      );
     }
     if (rows.length !== macroblockHeight) {
       throw new Error(`DNx frame requires ${macroblockHeight} row spans, got ${rows.length}.`);
@@ -208,9 +212,19 @@ class DnxZigWasmRowDecoder implements DnxRowDecoder {
 
     const frameByteLength = macroblockWidth * 16 * macroblockHeight * 16 * (is444 ? 3 : 2) * (bitDepth === 8 ? 1 : 2);
     if (frameByteLength > this.capacities.frameBytes) {
-      throw new Error(`DNx frame requires ${frameByteLength} bytes, exceeding the Zig buffer capacity.`);
+      throw new Error(
+        `DNx frame requires ${frameByteLength} bytes, exceeding the Zig buffer capacity of ${this.capacities.frameBytes} bytes.`
+      );
     }
 
+    // The packet and frame buffers grow on demand, and growing them can grow
+    // (and so replace) memory.buffer: reserve first, then make every view.
+    const reserved = this.exports.dnx_reserve_frame(packet.byteLength, frameByteLength);
+    if (reserved !== 0) {
+      throw new Error(
+        `Zig frame buffers for a ${packet.byteLength}-byte packet and a ${frameByteLength}-byte frame could not be reserved: ${ERROR_MESSAGES[reserved] ?? `unknown error ${reserved}`}.`
+      );
+    }
     this.configureTables(tables);
     new Uint8Array(this.exports.memory.buffer, this.exports.dnx_packet_buffer_ptr(), packet.byteLength).set(packet);
     const starts = new Uint32Array(this.exports.memory.buffer, this.exports.dnx_row_starts_ptr(), rows.length);
@@ -259,7 +273,9 @@ class DnxZigWasmRowDecoder implements DnxRowDecoder {
       throw new Error("DNx Zig row decoder is destroyed.");
     }
     if (rowBytes.byteLength > this.capacities.rowBytes) {
-      throw new Error(`DNx row requires ${rowBytes.byteLength} bytes, exceeding the Zig buffer capacity.`);
+      throw new Error(
+        `DNx row requires ${rowBytes.byteLength} bytes, exceeding the Zig buffer capacity of ${this.capacities.rowBytes} bytes.`
+      );
     }
     if (
       !Number.isInteger(macroblockWidth) ||
@@ -358,6 +374,7 @@ function validateExports(exports: Partial<DnxZigWasmExports>): asserts exports i
     "dnx_row_ends_ptr",
     "dnx_frame_capacity",
     "dnx_frame_buffer_ptr",
+    "dnx_reserve_frame",
     "dnx_dc_lookup_ptr",
     "dnx_ac_lookup_ptr",
     "dnx_run_lookup_ptr",

@@ -322,6 +322,22 @@
       "pixelFormat": "yuv422p10"
     },
     {
+      "path": "dnxhr_hq_8192x4320_smptehdbars.mxf.gz",
+      "sha256": "659e1a42fa0352a7c96a07ac625dd63c8e3534111efd76d17209c650a607eb93",
+      "cid": 1272,
+      "width": 8192,
+      "height": 4320,
+      "pixelFormat": "yuv422p8"
+    },
+    {
+      "path": "dnxhr_444_8192x4320_smptehdbars.mov.gz",
+      "sha256": "dcef5e5d399a083686814d9824d1ea4a226d453b60f870dc0a79b8748dc0ae91",
+      "cid": 1270,
+      "width": 8192,
+      "height": 4320,
+      "pixelFormat": "yuv444p10"
+    },
+    {
       "path": "dnxhr_hq_328x184.mxf",
       "sha256": "be5872a6c58e790d5dd5f4d4c443c221be2da085c5b606590792c15e75b41f0f",
       "cid": 1272,
